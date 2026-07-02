@@ -1,0 +1,12 @@
+services:
+  pipeline:
+    build: .
+    volumes:
+      - ./data:/app/data
+      - ./output:/app/output
+      # Optional: mount Kaggle credentials read-only for automatic download.
+      # Comment out if you're placing CSVs in data/raw/ manually instead.
+      - ${HOME}/.kaggle:/root/.kaggle:ro
+    environment:
+      - KAGGLE_USERNAME=${KAGGLE_USERNAME:-}
+      - KAGGLE_KEY=${KAGGLE_KEY:-}

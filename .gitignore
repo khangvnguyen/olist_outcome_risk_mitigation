@@ -1,0 +1,10 @@
+data/raw/*.csv
+data/raw/*.zip
+output/*
+!output/.gitkeep
+__pycache__/
+*.pyc
+.env
+.ipynb_checkpoints/
+*.egg-info/
+.DS_Store
