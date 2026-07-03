@@ -107,10 +107,12 @@ def build_order_items_agg(order_items: pd.DataFrame, products: pd.DataFrame,
     items = order_items.merge(products[["product_id", "product_category_name"]], on="product_id", how="left")
     items = items.merge(category_translation, on="product_category_name", how="left")
 
-    # primary category = category of the line with the highest price in the order
+    # primary category / seller = the line with the highest price in the order
+    # (used as a single representative value for orders with >1 item, which
+    # is most of them but not all -- see n_distinct_sellers for the caveat)
     idx = items.groupby("order_id")["price"].idxmax()
-    primary_cat = items.loc[idx, ["order_id", "product_category_name_english"]].rename(
-        columns={"product_category_name_english": "primary_category"}
+    primary = items.loc[idx, ["order_id", "product_category_name_english", "seller_id"]].rename(
+        columns={"product_category_name_english": "primary_category", "seller_id": "primary_seller_id"}
     )
 
     agg = items.groupby("order_id").agg(
@@ -121,7 +123,7 @@ def build_order_items_agg(order_items: pd.DataFrame, products: pd.DataFrame,
         total_freight_value=("freight_value", "sum"),
     ).reset_index()
 
-    agg = agg.merge(primary_cat, on="order_id", how="left")
+    agg = agg.merge(primary, on="order_id", how="left")
     return agg
 
 
@@ -176,6 +178,24 @@ def build_order_level_table(raw: dict) -> pd.DataFrame:
         on="customer_zip_code_prefix", how="left",
     )
 
+    # seller geolocation, via the primary (highest-price-item) seller's zip.
+    # Note: for multi-seller orders this is only one seller's location, not
+    # all of them -- an approximation, flagged in the EDA output.
+    seller_zip = raw["sellers"][["seller_id", "seller_zip_code_prefix"]].rename(
+        columns={"seller_id": "primary_seller_id"}
+    )
+    df = df.merge(seller_zip, on="primary_seller_id", how="left")
+    df = df.merge(
+        geo_lookup.rename(columns={"zip_code_prefix": "seller_zip_code_prefix",
+                                     "lat": "seller_lat", "lng": "seller_lng"})[
+            ["seller_zip_code_prefix", "seller_lat", "seller_lng"]
+        ],
+        on="seller_zip_code_prefix", how="left",
+    )
+    df["customer_seller_distance_km"] = haversine_km(
+        df["customer_lat"], df["customer_lng"], df["seller_lat"], df["seller_lng"]
+    )
+
     # target candidates
     # Note: using pandas' nullable "boolean" dtype (not plain numpy bool/float)
     # so that missing values coexist with True/False *and* groupby/comparisons
@@ -201,3 +221,39 @@ def build_order_level_table(raw: dict) -> pd.DataFrame:
     df["has_review_comment"] = df["review_comment_message"].notna()
 
     return df
+
+
+def build_seller_level_table(raw: dict, order_df: pd.DataFrame) -> pd.DataFrame:
+    """One row per seller_id, aggregating order-level outcomes across every
+    order that seller shipped at least one item in.
+
+    Caveat (important, not hidden): for the ~2% of orders with more than one
+    seller, that order's single bad_review outcome gets attributed to EACH
+    seller involved -- we can't split blame between co-sellers on one order
+    from this data. This means a seller's bad_review_rate here is "rate of
+    bad outcomes on orders this seller touched," not proof the seller alone
+    caused them. Fine for a first-pass concentration check; would need
+    item-level fault attribution (not available in this dataset) to go
+    further.
+    """
+    order_seller = raw["order_items"][["order_id", "seller_id"]].drop_duplicates()
+    order_outcomes = order_df[[
+        "order_id", "bad_review", "is_late", "is_canceled_or_unavailable",
+        "order_purchase_timestamp",
+    ]]
+    merged = order_seller.merge(order_outcomes, on="order_id", how="left")
+
+    seller_stats = merged.groupby("seller_id").agg(
+        n_orders=("order_id", "nunique"),
+        bad_review_rate=("bad_review", "mean"),
+        bad_review_count=("bad_review", "sum"),
+        late_rate=("is_late", "mean"),
+        cancel_rate=("is_canceled_or_unavailable", "mean"),
+        first_sale=("order_purchase_timestamp", "min"),
+        last_sale=("order_purchase_timestamp", "max"),
+    ).reset_index()
+
+    seller_stats = seller_stats.merge(
+        raw["sellers"][["seller_id", "seller_state", "seller_city"]], on="seller_id", how="left"
+    )
+    return seller_stats

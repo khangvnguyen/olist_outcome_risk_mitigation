@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from src.data.loader import RAW_DIR, load_raw, build_order_level_table
+from src.data.loader import RAW_DIR, load_raw, build_order_level_table, build_seller_level_table
 
 warnings.filterwarnings("ignore")
 
@@ -167,10 +167,16 @@ def section_target_candidates(df, report: Report):
 
 def section_target_overlap(df, report: Report):
     report.h2("3. How related are the candidate targets?")
-    report.p("Leakage note: `is_late` and `days_late` are only known after delivery, "
-              "so they are diagnostic outcomes, not eligible model inputs for a pre-outcome "
-              "risk model. This section uses them to explain review outcomes and to motivate "
-              "eligible proxy features such as historical seller/route on-time rates.\n")
+    report.p("Key question from problem_framing.md: does late delivery actually predict "
+              "low review score, or are they weakly linked (which would argue for treating "
+              "them as separate problems rather than one composite target)?\n")
+    report.p("**Leakage note:** `is_late` is only known *after* delivery, so even if it's a "
+              "strong correlate of `bad_review` (as it turns out to be, below), it cannot be "
+              "used directly as a model INPUT for a before-the-fact predictor -- it's an "
+              "outcome, not a predictor. What this section is really establishing is *whether "
+              "lateness is a meaningful causal channel worth building proxies for* (e.g. a "
+              "seller's historical on-time rate, which IS known in advance), not whether "
+              "`is_late` itself belongs in a feature set.\n")
 
     sub = df.dropna(subset=["review_score", "is_late"])
     grp = sub.groupby("is_late")["review_score"].agg(["mean", "median", "count"])
@@ -182,22 +188,22 @@ def section_target_overlap(df, report: Report):
         label = "late" if is_late_val else "on-time"
         report.p(f"- bad_review rate when {label}: {rate:.2f}%")
 
-    bad_review_counts = (
-        sub[sub["bad_review"]]
-        .groupby("is_late")["order_id"]
-        .count()
-        .rename("bad_review_count")
-    )
-    n_bad_review = int(bad_review_counts.sum())
-    n_late_bad = int(bad_review_counts.get(True, 0))
-    n_ontime_bad = int(bad_review_counts.get(False, 0))
-    if n_bad_review:
-        report.p(f"\n- Late delivered orders contribute {n_late_bad:,} bad reviews "
-                 f"({n_late_bad / n_bad_review * 100:.1f}% of bad reviews among orders with "
-                 "both review and lateness known).")
-        report.p(f"- On-time delivered orders contribute {n_ontime_bad:,} bad reviews "
-                 f"({n_ontime_bad / n_bad_review * 100:.1f}%), so logistics is a major per-order "
-                 "risk amplifier but not the whole dissatisfaction story.")
+    # contribution share: even if lateness strongly multiplies risk per-order,
+    # if most orders are on-time, on-time orders can still contribute the
+    # majority of TOTAL bad reviews. This matters for prioritisation.
+    bad_counts_by_late = sub.groupby("is_late")["bad_review"].sum()
+    total_bad = bad_counts_by_late.sum()
+    n_by_late = sub.groupby("is_late").size()
+    if total_bad > 0:
+        report.p("\nContribution to TOTAL bad reviews (not just rate):\n")
+        for is_late_val in [False, True]:
+            if is_late_val not in bad_counts_by_late.index:
+                continue
+            label = "late" if is_late_val else "on-time"
+            count = bad_counts_by_late.loc[is_late_val]
+            share = count / total_bad * 100
+            report.p(f"- {label} orders: {int(count):,} bad reviews out of {int(n_by_late.loc[is_late_val]):,} orders "
+                      f"({share:.1f}% of all bad reviews)")
 
     corr_sub = df.dropna(subset=["days_late", "review_score"])
     if len(corr_sub) > 10:
@@ -218,80 +224,80 @@ def section_target_overlap(df, report: Report):
               f"have a review score (mean {canc['review_score'].mean():.2f} where present).")
 
 
-def section_seller_variance(raw, df, report: Report):
+def section_seller_variance(df, raw, report: Report):
     report.h2("4. Seller-level variance (is this a seller problem?)")
+    report.p("**Attribution caveat:** for orders with more than one seller, that order's single "
+              "bad_review outcome is attributed to every seller involved (can't split blame from "
+              "this data). See `build_seller_level_table` docstring. This affects ~2% of orders.\n")
 
-    single_seller_ids = (
-        raw["order_items"]
-        .groupby("order_id")
-        .agg(
-            n_distinct_sellers=("seller_id", "nunique"),
-            seller_id=("seller_id", "first"),
-        )
-        .query("n_distinct_sellers == 1")
-        .reset_index()[["order_id", "seller_id"]]
+    seller_stats = build_seller_level_table(raw, df)
+    MIN_ORDERS = 10
+    qualified = seller_stats[seller_stats["n_orders"] >= MIN_ORDERS].copy()
+
+    report.p(f"- Total sellers: {len(seller_stats):,}")
+    report.p(f"- Sellers with >= {MIN_ORDERS} orders (used below for rate stability): {len(qualified):,} "
+              f"({len(qualified)/len(seller_stats)*100:.1f}% of sellers, but "
+              f"{qualified['n_orders'].sum()/seller_stats['n_orders'].sum()*100:.1f}% of order volume)")
+
+    rel = save_table(
+        qualified.sort_values("bad_review_rate", ascending=False).head(20),
+        "worst_20_sellers"
     )
-    single_seller = df.merge(single_seller_ids, on="order_id", how="inner")
-    report.p(f"- Single-seller orders used for this section: {len(single_seller):,} / {len(df):,} "
-              f"({len(single_seller)/len(df)*100:.1f}%) -- multi-seller orders excluded here since "
-              "the bad outcome can't be attributed to one seller from order-level data alone.")
+    report.table_ref(f"Worst 20 sellers by bad_review_rate (n_orders>={MIN_ORDERS})", rel)
 
-    reviewed = single_seller.dropna(subset=["bad_review"]).copy()
-    seller_stats = reviewed.groupby("seller_id").agg(
-        n_orders=("order_id", "count"),
-        bad_reviews=("bad_review", "sum"),
-        bad_review_rate=("bad_review", "mean"),
-        late_rate=("is_late", "mean"),
-        median_item_price=("total_item_price", "median"),
-        n_categories=("primary_category", "nunique"),
-    ).sort_values(["bad_review_rate", "n_orders"], ascending=[False, False])
-    seller_stats["share_of_all_bad_reviews"] = seller_stats["bad_reviews"] / seller_stats["bad_reviews"].sum()
+    # spread comparison vs category spread (section 5 computes its own;
+    # here we just report seller spread on the same qualifying basis so the
+    # two can be compared directly in the writeup)
+    if len(qualified) > 0:
+        spread = qualified["bad_review_rate"].max() - qualified["bad_review_rate"].min()
+        report.p(f"\n- Seller bad_review_rate spread (min-max, n_orders>={MIN_ORDERS}): {spread*100:.1f} pp "
+                  f"across {len(qualified):,} qualifying sellers")
+        weighted_std = np.sqrt(np.average(
+            (qualified["bad_review_rate"] - np.average(qualified["bad_review_rate"], weights=qualified["n_orders"])) ** 2,
+            weights=qualified["n_orders"]
+        ))
+        report.p(f"- Volume-weighted std of seller bad_review_rate: {weighted_std*100:.2f} pp "
+                  "(compare to the category-level spread in section 5 -- whichever grouping has "
+                  "the larger weighted std carries more distinguishing signal)")
 
-    rel = save_table(seller_stats.reset_index(), "seller_bad_review_rates")
-    report.table_ref("bad_review rate by seller, single-seller reviewed orders", rel)
+    # concentration / Pareto: what share of TOTAL bad reviews (within the
+    # qualifying set) comes from the worst decile of sellers by rate?
+    if len(qualified) >= 10:
+        q_sorted = qualified.sort_values("bad_review_rate", ascending=False).reset_index(drop=True)
+        total_bad_qualified = q_sorted["bad_review_count"].sum()
+        decile_cut = max(1, len(q_sorted) // 10)
+        worst_decile_bad = q_sorted.iloc[:decile_cut]["bad_review_count"].sum()
+        worst_decile_orders = q_sorted.iloc[:decile_cut]["n_orders"].sum()
+        share_of_bad = worst_decile_bad / total_bad_qualified * 100 if total_bad_qualified > 0 else float("nan")
+        share_of_orders = worst_decile_orders / q_sorted["n_orders"].sum() * 100
+        report.p(f"\n- Worst decile of qualifying sellers ({decile_cut} sellers, {share_of_orders:.1f}% of "
+                  f"qualifying order volume) account for {share_of_bad:.1f}% of bad reviews among "
+                  "qualifying sellers -- a concentration meaningfully above their order-volume share "
+                  "would support a seller-risk-scoring approach; a share close to their volume share "
+                  "would suggest bad outcomes are diffuse across sellers rather than concentrated in "
+                  "a few bad actors.")
 
-    min_n = 30
-    seller_stats_min_n = seller_stats.query("n_orders >= @min_n").copy()
-    rel = save_table(seller_stats_min_n.reset_index(), "seller_bad_review_rates_min30")
-    report.table_ref("seller bad_review rates with n_orders>=30", rel)
+    # does seller experience (order volume) correlate with quality?
+    if len(qualified) > 10:
+        corr = qualified["n_orders"].corr(qualified["bad_review_rate"])
+        report.p(f"\n- Correlation(seller order volume, bad_review_rate) = {corr:.3f} among qualifying "
+                  "sellers (negative would suggest more experienced/bigger sellers are more reliable).")
 
-    report.p(f"\n- Sellers with at least one reviewed single-seller order: {len(seller_stats):,}")
-    report.p(f"- Sellers with n_orders>={min_n}: {len(seller_stats_min_n):,}")
-    if len(seller_stats_min_n) > 0:
-        worst = seller_stats_min_n.iloc[0]
-        best = seller_stats_min_n.sort_values(["bad_review_rate", "n_orders"], ascending=[True, False]).iloc[0]
-        report.p(f"- Worst seller among n_orders>={min_n}: `{seller_stats_min_n.index[0]}` "
-                 f"({worst['bad_review_rate']*100:.1f}%, n={int(worst['n_orders'])})")
-        report.p(f"- Best seller among n_orders>={min_n}: `{best.name}` "
-                 f"({best['bad_review_rate']*100:.1f}%, n={int(best['n_orders'])})")
+    fig, ax = plt.subplots(figsize=(5, 3.5))
+    qualified["bad_review_rate"].hist(bins=30, ax=ax, color="#8172B2")
+    ax.set_xlabel("bad_review_rate")
+    ax.set_title(f"Seller bad_review_rate distribution (n_orders>={MIN_ORDERS})")
+    rel = savefig(fig, "seller_bad_review_rate_distribution")
+    report.fig_ref("Distribution of seller-level bad_review_rate", rel)
 
-    concentration_rows = []
-    ordered = seller_stats.sort_values("bad_reviews", ascending=False)
-    for pct in [0.01, 0.05, 0.10, 0.20]:
-        n_sellers = max(1, int(np.ceil(len(ordered) * pct)))
-        concentration_rows.append({
-            "top_seller_share": pct,
-            "n_sellers": n_sellers,
-            "bad_reviews_captured": int(ordered.head(n_sellers)["bad_reviews"].sum()),
-            "share_bad_reviews_captured": ordered.head(n_sellers)["bad_reviews"].sum() / ordered["bad_reviews"].sum(),
-            "orders_captured": int(ordered.head(n_sellers)["n_orders"].sum()),
-            "share_orders_captured": ordered.head(n_sellers)["n_orders"].sum() / ordered["n_orders"].sum(),
-        })
-    concentration = pd.DataFrame(concentration_rows)
-    rel = save_table(concentration, "seller_bad_review_concentration")
-    report.table_ref("concentration of bad reviews among sellers", rel)
-
-    top_5pct = concentration.loc[concentration["top_seller_share"] == 0.05].iloc[0]
-    report.p(f"- Top 5% of sellers by bad-review count account for "
-             f"{top_5pct['share_bad_reviews_captured']*100:.1f}% of bad reviews and "
-             f"{top_5pct['share_orders_captured']*100:.1f}% of reviewed single-seller orders.")
-
-    seller_rate_corr = seller_stats_min_n[["bad_review_rate", "late_rate"]].dropna()
-    if len(seller_rate_corr) > 10:
-        corr = seller_rate_corr["bad_review_rate"].corr(seller_rate_corr["late_rate"])
-        report.p(f"- Across sellers with n_orders>={min_n}, correlation between seller bad-review "
-                 f"rate and observed late rate is {corr:.3f}. This is diagnostic only; a model "
-                 "would need point-in-time historical rates.")
+    fig, ax = plt.subplots(figsize=(5, 3.5))
+    ax.scatter(qualified["n_orders"], qualified["bad_review_rate"], alpha=0.4, s=15, color="#4C72B0")
+    ax.set_xscale("log")
+    ax.set_xlabel("seller n_orders (log scale)")
+    ax.set_ylabel("bad_review_rate")
+    ax.set_title("Seller volume vs. bad_review_rate")
+    rel = savefig(fig, "seller_volume_vs_bad_review_rate")
+    report.fig_ref("Seller order volume vs. bad_review_rate (scatter)", rel)
 
 
 def section_category_variance(df, report: Report):
@@ -306,10 +312,6 @@ def section_category_variance(df, report: Report):
     rel = save_table(cat_stats.reset_index(), "category_bad_review_rates")
     report.table_ref("bad_review rate by product category (n_orders>=30), sorted worst-first", rel)
 
-    cat_stats_min100 = cat_stats.query("n_orders >= 100")
-    rel = save_table(cat_stats_min100.reset_index(), "category_bad_review_rates_min100")
-    report.table_ref("bad_review rate by product category (n_orders>=100), sorted worst-first", rel)
-
     report.p(f"\n- Categories analysed: {len(cat_stats)} (after filtering n_orders>=30)")
     if len(cat_stats) > 0:
         report.p(f"- Worst category: `{cat_stats.index[0]}` ({cat_stats['bad_review_rate'].iloc[0]*100:.1f}%, "
@@ -319,9 +321,6 @@ def section_category_variance(df, report: Report):
         spread = cat_stats["bad_review_rate"].max() - cat_stats["bad_review_rate"].min()
         report.p(f"- Spread (max-min bad_review_rate across categories): {spread*100:.1f} pp -- "
                   "a wide spread suggests category carries real signal; a narrow one suggests it doesn't.")
-        report.p("- The extreme best/worst categories should be treated cautiously because the "
-                 "n_orders>=30 table still includes small samples; use the n_orders>=100 table "
-                 "when choosing robust business examples.")
 
     fig, ax = plt.subplots(figsize=(6, 8))
     top = pd.concat([cat_stats.head(10), cat_stats.tail(10)])
@@ -361,12 +360,38 @@ def section_price_freight(df, report: Report):
 
 
 def section_distance(df, report: Report):
-    report.h2("7. Customer-seller distance (partial -- needs seller geolocation)")
-    report.p("**Known gap:** distance requires the seller's own zip-prefix centroid joined in "
-              "the same way as the customer's, which this pass doesn't yet do (order-level table "
-              "doesn't carry seller_zip_code_prefix after the items aggregation -- same root cause "
-              "as the seller-level gap in section 4). Deferred until we decide seller-level analysis "
-              "is worth the extra join complexity.")
+    report.h2("7. Customer-seller distance")
+    report.p("Distance uses the primary (highest-price-item) seller's zip centroid vs. the "
+              "customer's zip centroid -- an approximation for multi-seller orders (~2% of orders), "
+              "same caveat as section 4.\n")
+
+    n_missing = df["customer_seller_distance_km"].isna().sum()
+    report.p(f"- Orders with a computed distance: {len(df) - n_missing:,} / {len(df):,} "
+              f"({(len(df)-n_missing)/len(df)*100:.1f}%)")
+
+    sub = df.dropna(subset=["customer_seller_distance_km", "bad_review"])
+    if len(sub) > 10:
+        med = sub.groupby("bad_review")["customer_seller_distance_km"].median()
+        report.p(f"- Median distance (km): bad_review=False -> {med.get(False, float('nan')):.1f}, "
+                  f"bad_review=True -> {med.get(True, float('nan')):.1f}")
+        corr = sub["customer_seller_distance_km"].corr(sub["bad_review"].astype(float))
+        report.p(f"- Correlation(distance_km, bad_review) = {corr:.3f} (n={len(sub):,})")
+
+        # distance is a plausible proxy for delivery lateness risk -- check
+        late_sub = df.dropna(subset=["customer_seller_distance_km", "is_late"])
+        if len(late_sub) > 10:
+            corr_late = late_sub["customer_seller_distance_km"].corr(late_sub["is_late"].astype(float))
+            report.p(f"- Correlation(distance_km, is_late) = {corr_late:.3f} (n={len(late_sub):,}) -- "
+                      "checking whether distance explains lateness, since distance (unlike is_late "
+                      "itself) IS known at order time and could be a usable predictor.")
+
+    fig, ax = plt.subplots(figsize=(5, 3.5))
+    sub.boxplot(column="customer_seller_distance_km", by="bad_review", ax=ax)
+    ax.set_ylim(0, sub["customer_seller_distance_km"].quantile(0.95) if len(sub) > 0 else 1)
+    ax.set_title("Distance by bad_review")
+    plt.suptitle("")
+    rel = savefig(fig, "distance_by_bad_review")
+    report.fig_ref("Customer-seller distance by bad_review (clipped at p95)", rel)
 
 
 def section_time_trends(df, report: Report):
@@ -414,7 +439,7 @@ def main():
     section_target_overlap(df, report)
 
     print("[eda] Section 4: seller variance...")
-    section_seller_variance(raw, df, report)
+    section_seller_variance(df, raw, report)
 
     print("[eda] Section 5: category variance...")
     section_category_variance(df, report)
