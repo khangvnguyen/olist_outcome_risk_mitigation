@@ -26,7 +26,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from src.data.loader import RAW_DIR, load_raw, build_order_level_table, build_seller_level_table
+from src.data.loader import (
+    RAW_DIR, load_raw, build_order_level_table, build_seller_level_table,
+    build_product_level_table,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -50,6 +53,9 @@ def savefig(fig, name):
 def save_table(df, name):
     TABLE_DIR.mkdir(parents=True, exist_ok=True)
     path = TABLE_DIR / f"{name}.csv"
+    df = df.copy()
+    float_cols = df.select_dtypes(include=["float64", "float32", "Float64"]).columns
+    df[float_cols] = df[float_cols].round(4)
     df.to_csv(path, index=False)
     return path.relative_to(OUTPUT_DIR)
 
@@ -433,6 +439,274 @@ def section_time_trends(df, report: Report):
     report.fig_ref("Monthly volume and bad_review rate", rel)
 
 
+def section_product_variance(df, raw, report: Report):
+    report.h2("9. Product-level concentration (sharper than category?)")
+    report.p("Same method as the seller-level analysis (section 4), applied to individual "
+              "products instead of the coarser category grouping in section 5. Question: does "
+              "a small number of specific bad products drive category-level rates, or is badness "
+              "spread evenly within categories?\n")
+
+    product_stats = build_product_level_table(raw, df)
+    MIN_ORDERS = 10
+    qualified = product_stats[product_stats["n_orders"] >= MIN_ORDERS].copy()
+
+    report.p(f"- Total distinct products: {len(product_stats):,}")
+    report.p(f"- Products with >= {MIN_ORDERS} orders: {len(qualified):,} "
+              f"({len(qualified)/len(product_stats)*100:.1f}% of products, "
+              f"{qualified['n_orders'].sum()/product_stats['n_orders'].sum()*100:.1f}% of order volume) "
+              "-- most products sell too rarely for a stable per-product rate, expect this to be a "
+              "small minority of the catalogue.")
+
+    if len(qualified) > 0:
+        rel = save_table(qualified.sort_values("bad_review_rate", ascending=False).head(20), "worst_20_products")
+        report.table_ref(f"Worst 20 products by bad_review_rate (n_orders>={MIN_ORDERS})", rel)
+
+        p_weighted_std = weighted_std(qualified["bad_review_rate"].values, qualified["n_orders"].values)
+        report.p(f"\n- Volume-weighted std of product bad_review_rate: {p_weighted_std*100:.2f} pp "
+                  "-- compare directly to seller (section 4) and category (section 5) figures, same "
+                  "method. If this is meaningfully larger than the category figure, it means "
+                  "category-level rates are hiding sharper product-specific problems.")
+
+        q_sorted = qualified.sort_values("bad_review_rate", ascending=False).reset_index(drop=True)
+        total_bad = q_sorted["bad_review_count"].sum()
+        decile_cut = max(1, len(q_sorted) // 10)
+        worst_decile_bad = q_sorted.iloc[:decile_cut]["bad_review_count"].sum()
+        worst_decile_orders = q_sorted.iloc[:decile_cut]["n_orders"].sum()
+        if total_bad > 0:
+            report.p(f"- Worst decile of qualifying products ({decile_cut} products, "
+                      f"{worst_decile_orders/q_sorted['n_orders'].sum()*100:.1f}% of qualifying volume) "
+                      f"account for {worst_decile_bad/total_bad*100:.1f}% of bad reviews among qualifying products.")
+
+
+def section_geography(df, report: Report):
+    report.h2("10. Geographic patterns (buyer and seller location)")
+    report.p("Distinct from section 7 (physical distance): this asks whether specific customer "
+              "or seller regions have systematically different bad_review rates, independent of "
+              "how far apart buyer and seller are.\n")
+
+    # customer state
+    sub = df.dropna(subset=["customer_state", "bad_review"])
+    cust_state = sub.groupby("customer_state").agg(
+        n_orders=("order_id", "count"), bad_review_rate=("bad_review", "mean")
+    ).query("n_orders >= 30").sort_values("bad_review_rate", ascending=False)
+    rel = save_table(cust_state.reset_index(), "bad_review_by_customer_state")
+    report.table_ref("bad_review rate by customer_state (n_orders>=30)", rel)
+    if len(cust_state) > 0:
+        cust_wstd = weighted_std(cust_state["bad_review_rate"].values, cust_state["n_orders"].values)
+        report.p(f"- Customer state: worst=`{cust_state.index[0]}` ({cust_state['bad_review_rate'].iloc[0]*100:.1f}%), "
+                  f"best=`{cust_state.index[-1]}` ({cust_state['bad_review_rate'].iloc[-1]*100:.1f}%), "
+                  f"volume-weighted std={cust_wstd*100:.2f} pp")
+
+    # seller state
+    sub2 = df.dropna(subset=["seller_state", "bad_review"])
+    sell_state = sub2.groupby("seller_state").agg(
+        n_orders=("order_id", "count"), bad_review_rate=("bad_review", "mean")
+    ).query("n_orders >= 30").sort_values("bad_review_rate", ascending=False)
+    rel = save_table(sell_state.reset_index(), "bad_review_by_seller_state")
+    report.table_ref("bad_review rate by seller_state (n_orders>=30)", rel)
+    if len(sell_state) > 0:
+        sell_wstd = weighted_std(sell_state["bad_review_rate"].values, sell_state["n_orders"].values)
+        report.p(f"- Seller state: worst=`{sell_state.index[0]}` ({sell_state['bad_review_rate'].iloc[0]*100:.1f}%), "
+                  f"best=`{sell_state.index[-1]}` ({sell_state['bad_review_rate'].iloc[-1]*100:.1f}%), "
+                  f"volume-weighted std={sell_wstd*100:.2f} pp -- compare to customer-state figure above "
+                  "and to seller/category/product figures elsewhere for relative signal strength.")
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    cust_state["bad_review_rate"].sort_values().plot(kind="barh", ax=axes[0], color="#4C72B0")
+    axes[0].set_title("bad_review rate by customer_state")
+    sell_state["bad_review_rate"].sort_values().plot(kind="barh", ax=axes[1], color="#DD8452")
+    axes[1].set_title("bad_review rate by seller_state")
+    fig.tight_layout()
+    rel = savefig(fig, "bad_review_by_state")
+    report.fig_ref("bad_review rate by customer_state / seller_state", rel)
+
+    # top cities (higher small-n noise risk, flagged explicitly)
+    for label, col, fname in [
+        ("customer_city", "customer_city", "bad_review_by_customer_city"),
+        ("seller_city", "seller_city", "bad_review_by_seller_city"),
+    ]:
+        s = df.dropna(subset=[col, "bad_review"])
+        city_stats = s.groupby(col).agg(
+            n_orders=("order_id", "count"), bad_review_rate=("bad_review", "mean")
+        ).query("n_orders >= 50").sort_values("bad_review_rate", ascending=False)
+        rel = save_table(city_stats.reset_index(), fname)
+        report.table_ref(f"bad_review rate by {label} (n_orders>=50; small-n noise likely even at this threshold)", rel)
+
+    # lane analysis: customer_state x seller_state
+    lane = df.dropna(subset=["customer_state", "seller_state", "bad_review"])
+    lane_stats = lane.groupby(["seller_state", "customer_state"]).agg(
+        n_orders=("order_id", "count"), bad_review_rate=("bad_review", "mean"),
+        avg_distance_km=("customer_seller_distance_km", "mean"),
+    ).query("n_orders >= 50").sort_values("bad_review_rate", ascending=False)
+    rel = save_table(lane_stats.reset_index(), "bad_review_by_lane")
+    report.table_ref("bad_review rate by seller_state->customer_state lane (n_orders>=50), worst-first", rel)
+    if len(lane_stats) > 0:
+        overall_rate = df["bad_review"].mean()
+        # NOTE: deliberately NOT doing `lane_stats.iloc[0]` to grab a whole row --
+        # this DataFrame mixes a nullable Float64 column (bad_review_rate, from
+        # aggregating the nullable boolean bad_review) with plain float32/int64
+        # columns. Pulling a whole row forces pandas to unify dtypes, which
+        # silently turns a real float NaN (missing distance) into pd.NA -- and
+        # pd.NA formats as the literal string "<NA>" instead of raising or
+        # printing "nan", which would have shipped a confusing report. Indexing
+        # each column separately keeps its native dtype and avoids this.
+        worst_seller_state, worst_customer_state = lane_stats.index[0]
+        worst_rate = float(lane_stats["bad_review_rate"].iloc[0])
+        worst_n = int(lane_stats["n_orders"].iloc[0])
+        worst_dist = lane_stats["avg_distance_km"].iloc[0]
+        dist_str = f"{worst_dist:.0f}km" if pd.notna(worst_dist) else "unknown (no geolocation match for this lane)"
+        report.p(f"\n- Worst lane: `{worst_seller_state}` -> `{worst_customer_state}` "
+                  f"({worst_rate*100:.1f}% vs. {overall_rate*100:.1f}% overall, "
+                  f"n={worst_n}, avg distance {dist_str}) -- "
+                  "if this lane's rate is far above what its distance alone would suggest (compare to "
+                  "the weak overall distance-bad_review correlation in section 7), that points to a "
+                  "route/regional-logistics effect beyond raw distance, not just \"it's far away.\"")
+
+
+def section_business_impact(df, report: Report):
+    report.h2("11. Business impact: revenue at risk and repurchase")
+    report.p("Translates statistical patterns into rough R$ terms. These are descriptive / "
+              "correlational estimates, not causal -- see caveats inline.\n")
+
+    # revenue at risk
+    sub = df.dropna(subset=["bad_review", "order_value"])
+    total_value = sub["order_value"].sum()
+    bad_value = sub.loc[sub["bad_review"].astype(bool), "order_value"].sum()
+    report.p(f"- Total order value (reviewed orders): R$ {total_value:,.0f}")
+    report.p(f"- Order value sitting in bad_review orders: R$ {bad_value:,.0f} "
+              f"({bad_value/total_value*100:.1f}% of total order value, vs. "
+              f"{sub['bad_review'].mean()*100:.1f}% of orders by count -- "
+              f"{'higher' if bad_value/total_value > sub['bad_review'].mean() else 'lower'} share of "
+              "value than share of count would suggest bad reviews skew toward "
+              f"{'higher' if bad_value/total_value > sub['bad_review'].mean() else 'lower'}-value orders)")
+
+    # repurchase / churn analysis using customer_unique_id
+    report.p("\n**Repurchase analysis** (uses `customer_unique_id`, which identifies the same "
+              "real customer across multiple `customer_id`/orders):\n")
+
+    cust = df.dropna(subset=["customer_unique_id", "order_purchase_timestamp"]).copy()
+    max_date = cust["order_purchase_timestamp"].max()
+    censor_cutoff = max_date - pd.Timedelta(days=180)
+
+    first_orders = (
+        cust.sort_values("order_purchase_timestamp")
+        .groupby("customer_unique_id")
+        .first()
+        .reset_index()
+    )
+    order_counts = cust.groupby("customer_unique_id")["order_id"].nunique().rename("n_orders_total")
+    first_orders = first_orders.merge(order_counts, on="customer_unique_id", how="left")
+    first_orders["repurchased"] = first_orders["n_orders_total"] > 1
+
+    # downstream (post-first-order) revenue per customer, 0 for non-repurchasers
+    downstream_value = (
+        cust.sort_values("order_purchase_timestamp")
+        .groupby("customer_unique_id")
+        .apply(lambda g: g["order_value"].iloc[1:].sum() if len(g) > 1 else 0.0, include_groups=False)
+        .rename("downstream_value")
+    )
+    first_orders = first_orders.merge(downstream_value, on="customer_unique_id", how="left")
+
+    eligible = first_orders[
+        (first_orders["order_purchase_timestamp"] <= censor_cutoff) & first_orders["bad_review"].notna()
+    ]
+    report.p(f"- Customers eligible for this analysis (first order >=180 days before the dataset's "
+              f"last order, so they had a fair window to reorder, and first order was reviewed): "
+              f"{len(eligible):,} / {len(first_orders):,}")
+
+    if len(eligible) > 20:
+        grp = eligible.groupby(eligible["bad_review"].astype(bool)).agg(
+            n_customers=("customer_unique_id", "count"),
+            repurchase_rate=("repurchased", "mean"),
+            avg_downstream_value=("downstream_value", "mean"),
+        )
+        rel = save_table(grp.reset_index(), "repurchase_by_first_order_outcome")
+        report.table_ref("Repurchase rate and avg. downstream value, by first-order bad_review status", rel)
+
+        if True in grp.index and False in grp.index:
+            rr_good = grp.loc[False, "repurchase_rate"]
+            rr_bad = grp.loc[True, "repurchase_rate"]
+            dv_good = grp.loc[False, "avg_downstream_value"]
+            dv_bad = grp.loc[True, "avg_downstream_value"]
+            report.p(f"\n- Repurchase rate after a GOOD first order: {rr_good*100:.2f}%")
+            report.p(f"- Repurchase rate after a BAD first order: {rr_bad*100:.2f}%")
+            report.p(f"- Avg. downstream order value per customer, good first order: R$ {dv_good:.2f}")
+            report.p(f"- Avg. downstream order value per customer, bad first order: R$ {dv_bad:.2f}")
+            gap = dv_good - dv_bad
+            n_bad_total = int(sub["bad_review"].astype(bool).sum())
+            rough_estimate = gap * n_bad_total
+            direction = "lower" if gap > 0 else "higher"
+            report.p(f"\n- **Rough back-of-envelope:** customers whose first order was bad had "
+                      f"R$ {abs(gap):.2f} {direction} average downstream order value than customers "
+                      f"whose first order was good. Applying that per-customer gap to all "
+                      f"{n_bad_total:,} bad-review orders in the full dataset (not just the eligible "
+                      f"subset) gives an illustrative figure of **R$ {abs(rough_estimate):,.0f}** in "
+                      f"associated downstream revenue {'at risk' if gap > 0 else '(no apparent downside found in this data)'}. "
+                      "**This is NOT a causal estimate** -- customers who leave bad reviews may differ "
+                      "from those who don't in ways unrelated to the bad experience itself (e.g. more "
+                      "price-sensitive, one-off gift buyers, different product mix), and a near-zero or "
+                      "reversed gap here doesn't necessarily mean bad reviews are harmless -- it may "
+                      "mean this back-of-envelope approach is too crude to detect the effect. Treat as "
+                      "an order-of-magnitude illustration prompting a proper causal design (e.g. "
+                      "matching on customer/order characteristics, or a controlled experiment), not a "
+                      "number to put in a business case as-is.")
+    else:
+        report.p("- Not enough eligible customers in this run to report repurchase stats reliably.")
+
+
+PT_STOPWORDS = set("""
+a as o os um uma uns umas de da do das dos em no na nos nas para por com sem
+que quem qual quais e ou mas se nao não muito mais menos ja já ainda so só
+foi ser estar tem tem tinha era sao são eu tu ele ela nos vos eles elas meu
+minha teu tua seu sua nosso nossa este esta esse essa aquele aquela isto
+isso aquilo ao aos à às pelo pela pelos pelas num numa entre até após como
+quando onde porque pois todo toda todos todas outro outra outros outras
+me te lhe lhes nos vos ja mesmo mesma sobre depois antes
+""".split())
+
+
+def section_qualitative_text(df, report: Report):
+    report.h2("12. Qualitative signal: what do bad-but-on-time reviews say?")
+    report.p("Section 3 showed 66% of bad reviews happen on orders that arrived on time -- so "
+              "what's driving those? `review_comment_message` can't be a model FEATURE (it's only "
+              "written after the outcome), but reading it tells us what's actually going wrong, "
+              "which the structured columns don't capture (no product-defect flag, no "
+              "expectation-mismatch flag, etc). Two views: a reproducible word-frequency count, and "
+              "a fixed random sample for manual spot-reading.\n")
+
+    target = df[
+        (df["bad_review"].fillna(False).astype(bool)) &
+        (df["is_late"].fillna(False).astype(bool) == False) &  # noqa: E712 -- explicit re: nullable bool
+        (df["review_comment_message"].notna())
+    ].copy()
+    report.p(f"- Bad-review, on-time (or unknown-lateness), with a comment: {len(target):,} orders")
+
+    if len(target) > 0:
+        # word frequency (reproducible, quantitative)
+        import re
+        from collections import Counter
+        counter = Counter()
+        for msg in target["review_comment_message"].astype(str):
+            tokens = re.findall(r"[a-zà-ú]+", msg.lower())
+            for t in tokens:
+                if len(t) >= 3 and t not in PT_STOPWORDS:
+                    counter[t] += 1
+        top_words = pd.DataFrame(counter.most_common(30), columns=["word", "count"])
+        rel = save_table(top_words, "bad_ontime_review_word_frequency")
+        report.table_ref("Top 30 words in bad-review/on-time comments (Portuguese, stopwords removed)", rel)
+
+        # fixed random sample for manual reading
+        sample_cols = ["order_id", "review_score", "primary_category", "order_value",
+                        "review_comment_title", "review_comment_message"]
+        sample = target[sample_cols].sample(n=min(40, len(target)), random_state=42)
+        rel = save_table(sample, "bad_ontime_review_sample")
+        report.table_ref("Fixed random sample (n<=40, seed=42) of bad-review/on-time comments for manual reading", rel)
+        report.p("\n**Note:** the sample and word list are in Portuguese (original review language) -- "
+                  "worth a native/fluent read-through rather than machine translation, which tends to "
+                  "flatten exactly the complaint-specific wording (e.g. sizing, color-mismatch, "
+                  "defect terms) that's most informative here.")
+
+
 def main():
     print("[eda] Loading raw tables...")
     raw = load_raw(RAW_DIR)
@@ -466,6 +740,18 @@ def main():
 
     print("[eda] Section 8: time trends...")
     section_time_trends(df, report)
+
+    print("[eda] Section 9: product variance...")
+    section_product_variance(df, raw, report)
+
+    print("[eda] Section 10: geography...")
+    section_geography(df, report)
+
+    print("[eda] Section 11: business impact...")
+    section_business_impact(df, report)
+
+    print("[eda] Section 12: qualitative text...")
+    section_qualitative_text(df, report)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     report.write(OUTPUT_DIR / "summary.md")

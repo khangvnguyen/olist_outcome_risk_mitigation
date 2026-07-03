@@ -178,13 +178,13 @@ def build_order_level_table(raw: dict) -> pd.DataFrame:
         on="customer_zip_code_prefix", how="left",
     )
 
-    # seller geolocation, via the primary (highest-price-item) seller's zip.
-    # Note: for multi-seller orders this is only one seller's location, not
-    # all of them -- an approximation, flagged in the EDA output.
-    seller_zip = raw["sellers"][["seller_id", "seller_zip_code_prefix"]].rename(
+    # seller geolocation + state/city, via the primary (highest-price-item)
+    # seller's zip. Note: for multi-seller orders this is only one seller's
+    # location, not all of them -- an approximation, flagged in EDA output.
+    seller_info = raw["sellers"][["seller_id", "seller_zip_code_prefix", "seller_state", "seller_city"]].rename(
         columns={"seller_id": "primary_seller_id"}
     )
-    df = df.merge(seller_zip, on="primary_seller_id", how="left")
+    df = df.merge(seller_info, on="primary_seller_id", how="left")
     df = df.merge(
         geo_lookup.rename(columns={"zip_code_prefix": "seller_zip_code_prefix",
                                      "lat": "seller_lat", "lng": "seller_lng"})[
@@ -220,7 +220,42 @@ def build_order_level_table(raw: dict) -> pd.DataFrame:
     df["estimated_delivery_days"] = (df["order_estimated_delivery_date"] - df["order_purchase_timestamp"]).dt.total_seconds() / 86400
     df["has_review_comment"] = df["review_comment_message"].notna()
 
+    # order_value: item price + freight, used for revenue-at-risk analysis.
+    # Deliberately NOT total_payment_value -- payments can include e.g.
+    # voucher amounts that don't map cleanly to items, whereas this ties
+    # directly to what was actually bought and shipped.
+    df["order_value"] = df["total_item_price"] + df["total_freight_value"]
+
     return df
+
+
+def _build_entity_level_table(raw: dict, order_df: pd.DataFrame, entity_col: str,
+                                entity_info: pd.DataFrame = None) -> pd.DataFrame:
+    """Shared logic for attributing order-level outcomes to a per-item entity
+    (seller_id or product_id). Same attribution caveat applies in both
+    cases: for orders with multiple distinct values of `entity_col`, that
+    order's single outcome is attributed to every one of them.
+    """
+    entity_link = raw["order_items"][["order_id", entity_col]].drop_duplicates()
+    order_outcomes = order_df[[
+        "order_id", "bad_review", "is_late", "is_canceled_or_unavailable",
+        "order_purchase_timestamp",
+    ]]
+    merged = entity_link.merge(order_outcomes, on="order_id", how="left")
+
+    stats = merged.groupby(entity_col).agg(
+        n_orders=("order_id", "nunique"),
+        bad_review_rate=("bad_review", "mean"),
+        bad_review_count=("bad_review", "sum"),
+        late_rate=("is_late", "mean"),
+        cancel_rate=("is_canceled_or_unavailable", "mean"),
+        first_sale=("order_purchase_timestamp", "min"),
+        last_sale=("order_purchase_timestamp", "max"),
+    ).reset_index()
+
+    if entity_info is not None:
+        stats = stats.merge(entity_info, on=entity_col, how="left")
+    return stats
 
 
 def build_seller_level_table(raw: dict, order_df: pd.DataFrame) -> pd.DataFrame:
@@ -236,24 +271,18 @@ def build_seller_level_table(raw: dict, order_df: pd.DataFrame) -> pd.DataFrame:
     item-level fault attribution (not available in this dataset) to go
     further.
     """
-    order_seller = raw["order_items"][["order_id", "seller_id"]].drop_duplicates()
-    order_outcomes = order_df[[
-        "order_id", "bad_review", "is_late", "is_canceled_or_unavailable",
-        "order_purchase_timestamp",
-    ]]
-    merged = order_seller.merge(order_outcomes, on="order_id", how="left")
+    entity_info = raw["sellers"][["seller_id", "seller_state", "seller_city"]]
+    return _build_entity_level_table(raw, order_df, "seller_id", entity_info)
 
-    seller_stats = merged.groupby("seller_id").agg(
-        n_orders=("order_id", "nunique"),
-        bad_review_rate=("bad_review", "mean"),
-        bad_review_count=("bad_review", "sum"),
-        late_rate=("is_late", "mean"),
-        cancel_rate=("is_canceled_or_unavailable", "mean"),
-        first_sale=("order_purchase_timestamp", "min"),
-        last_sale=("order_purchase_timestamp", "max"),
-    ).reset_index()
 
-    seller_stats = seller_stats.merge(
-        raw["sellers"][["seller_id", "seller_state", "seller_city"]], on="seller_id", how="left"
+def build_product_level_table(raw: dict, order_df: pd.DataFrame) -> pd.DataFrame:
+    """One row per product_id, same logic/caveat as build_seller_level_table
+    but attributing outcomes to products instead of sellers. Useful for
+    checking whether bad outcomes concentrate in a small number of specific
+    products more sharply than they do at the coarser category level."""
+    entity_info = raw["products"][["product_id", "product_category_name"]].merge(
+        raw["category_translation"], on="product_category_name", how="left"
+    )[["product_id", "product_category_name_english"]].rename(
+        columns={"product_category_name_english": "category"}
     )
-    return seller_stats
+    return _build_entity_level_table(raw, order_df, "product_id", entity_info)
