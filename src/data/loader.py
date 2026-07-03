@@ -111,8 +111,9 @@ def build_order_items_agg(order_items: pd.DataFrame, products: pd.DataFrame,
     # (used as a single representative value for orders with >1 item, which
     # is most of them but not all -- see n_distinct_sellers for the caveat)
     idx = items.groupby("order_id")["price"].idxmax()
-    primary = items.loc[idx, ["order_id", "product_category_name_english", "seller_id"]].rename(
-        columns={"product_category_name_english": "primary_category", "seller_id": "primary_seller_id"}
+    primary = items.loc[idx, ["order_id", "product_category_name_english", "seller_id", "product_id"]].rename(
+        columns={"product_category_name_english": "primary_category", "seller_id": "primary_seller_id",
+                 "product_id": "primary_product_id"}
     )
 
     agg = items.groupby("order_id").agg(
