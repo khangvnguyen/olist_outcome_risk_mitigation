@@ -1,35 +1,44 @@
-# Problem Framing (Draft v2 — after initial EDA)
+# Problem Framing (v2 — target decision confirmed post-EDA)
 
-This is still a living document, but the first EDA pass in
-`output/eda/summary.md` now gives enough evidence to tighten the framing before
-modeling.
+This is a living document. Section 1's target decision is now confirmed
+(see below). Sections 2-4 remain hypotheses to be finalized as feature
+engineering and modeling proceed.
 
 ## 1. What is a "bad outcome"?
 
-Candidate operationalisations, from the tables available:
+**DECISION (post-EDA):** `bad_review` (review_score <= 2) is the primary target.
+EDA (see `output/eda/summary.md`) showed `is_late` and `is_canceled_or_unavailable`
+are only distantly related to `bad_review` -- most bad reviews (66%) occur on
+orders that arrived on time, and canceled orders are a small (1.2%), distinct
+segment. Blending them into one composite label would obscure more than it
+reveals. `is_late` and `is_canceled_or_unavailable` remain useful as
+**diagnostic sub-analyses** (why orders go bad) and as the basis for a
+point-in-time seller-history feature (seller's historical on-time rate), but
+are not part of the target itself.
+
+**Restated problem (post-EDA):** using information available at/near order
+time (order attributes, and seller history computed with a point-in-time
+cutoff so no future information leaks in), predict whether a given order
+will receive a low review score (1-2 stars), so Ops can intervene during
+the fulfillment window rather than finding out after the fact. Note this is
+closer to "predict at time of dispatch" than "predict at instant of
+checkout" in practical terms, since some of the most useful features
+(seller history) only stabilize with order volume -- worth stating plainly
+rather than overclaiming immediacy.
+
+Candidate operationalisations considered:
 
 | Candidate | Source | Pros | Cons |
 |---|---|---|---|
-| `review_score <= 2` | `olist_order_reviews_dataset` | Direct proxy for dissatisfaction; business already collects it; review score exists for 99.2% of orders | Subjective, confounded by things outside seller/product control (e.g. customer mood); text comments are much sparser than scores |
+| `review_score <= 2` | `olist_order_reviews_dataset` | Direct proxy for dissatisfaction; business already collects it | Only ~58% of orders have a text comment (score itself has 0% missing though); subjective, confounded by things outside seller/product control (e.g. customer mood) |
 | Late delivery: `order_delivered_customer_date > order_estimated_delivery_date` | `olist_orders_dataset` | Objective, operationally actionable (Ops can act on ETA slippage directly) | Doesn't capture product-quality complaints; ~3% missing delivered dates (likely lost/cancelled orders) |
 | Order not delivered: `order_status in {canceled, unavailable}` | `olist_orders_dataset` | Objective, severe outcome | Small class (~1.2% combined); may be driven by stock/logistics issues unrelated to "quality" |
 | Composite: low review OR late OR canceled | combination | Broadest definition of "bad experience" | Blends causally distinct problems into one target — risks an uninterpretable model |
 
-**Decision after EDA:** use `review_score <= 2` as the primary target. It has a
-14.68% positive rate among reviewed orders, which is large enough for a
-classifier or risk-ranking model to be feasible.
-
-Late delivery and canceled/unavailable status are not model inputs for a
-pre-outcome model. They remain diagnostic outcomes:
-- late delivered orders have a much higher bad-review rate (53.99% vs. 9.23%)
-- but on-time delivered orders still contribute about two thirds of bad reviews
-  among orders with both review and lateness known
-- canceled/unavailable orders are rare (1.24%) but severe, with average review
-  score 1.67 where reviewed
-
-This means the story is not "predict lateness and we are done." Logistics is a
-major risk amplifier, while product/category, seller quality, and expectation
-effects still matter for the majority of bad reviews.
+*(This table reflects the pre-EDA candidate list. Decision confirmed above:
+`review_score <= 2` is primary; lateness/cancellation are diagnostic, not
+target components. Resolved by the actual EDA numbers, not by the a priori
+guess this table represents.)*
 
 ## 2. Feature eligibility: pre-outcome vs. post-outcome
 
@@ -46,7 +55,6 @@ we're not predicting anything — we're describing the past.
 
 **Ineligible (leakage — only known after the fact):**
 - `order_delivered_carrier_date`, `order_delivered_customer_date` (actual, not estimated)
-- `is_late`, `days_late`, and actual `delivery_days`
 - `review_score`, `review_comment_*` themselves, and `review_answer_timestamp`
 - Final `order_status` if it's later than "processing" states
 
@@ -54,31 +62,33 @@ This boundary needs to be enforced mechanically in the feature pipeline
 (explicit allowlist), not just as a design note, since it's easy to
 accidentally leak via joins.
 
-**Post-EDA seller feature decision:** seller history is worth trying, but only
-with a point-in-time cutoff. In single-seller reviewed orders, 619 sellers have
-at least 30 orders, and seller bad-review rates vary widely. The top 5% of
-sellers by bad-review count account for 56.7% of bad reviews but also 51.4% of
-orders, so seller concentration is not a standalone explanation. Seller identity
-should be represented as historical risk features rather than used as a naive
-post-hoc league table.
+**Resolved (post-EDA):** seller-level variance is real but moderate, not
+extreme — the worst decile of sellers (by order volume, n>=10) accounts for
+~2.5x their proportional share of bad reviews (11.4% of bad reviews from
+4.6% of order volume), and there's ~no correlation between seller order
+volume and bad-review rate (r=0.006), so "seller experience" isn't a usable
+shortcut proxy. This is meaningful but not dominant signal -- worth
+including as a feature (with the point-in-time cutoff described above), but
+not sufficient on its own; category and price/freight carry comparable
+signal (see `output/eda/summary.md` sections 4-6 for the exact,
+volume-weighted-std comparison across groupings). The point-in-time cutoff
+is worth the implementation complexity given this.
 
 ## 3. What "useful" means here
 
-Useful means ranking orders by risk early enough for Marketplace Operations to
-act, while also explaining the main operational levers:
-- order-level bad-review risk score using only features known at or near order
-  time
-- interpretation by feature groups: seller history, category/product, price and
-  freight, customer/seller geography, and payment structure
-- separate diagnostic readout for late and canceled/unavailable orders, because
-  these explain important failure modes but are not valid model inputs
+**Decision (post-EDA):** build an order-level classifier (predicting
+`bad_review`) using pre-outcome order attributes plus point-in-time seller
+history, evaluated primarily on ranking quality (can Ops trust a risk score
+to prioritize a limited pool of interventions?) rather than raw accuracy,
+given the ~15% positive rate. A ranked seller risk table is a secondary,
+cheap-to-produce deliverable alongside it, since seller signal is real but
+not concentrated enough to replace a multivariate model on its own (see
+section 2). "Useful" = a risk score Ops can act on for a subset of orders
+during the fulfillment window, not a guarantee of individual-order
+certainty -- precision/recall tradeoffs and calibration will be reported
+honestly rather than oversold.
 
-The next deliverable should therefore be a simple, honest classifier or risk
-ranker plus a short segmentation readout. A pure seller ranking would be too
-narrow, because most bad reviews are not explained by late delivery alone and
-seller bad-review concentration is partly just seller order volume.
-
-## 4. Known data-quality caveats to carry forward
+## 4. Known data-quality caveats to carry into EDA
 
 - `olist_geolocation_dataset` has ~26% duplicate rows and multiple lat/lng
   per zip prefix — needs de-duplication/aggregation (e.g. centroid per

@@ -54,6 +54,16 @@ def save_table(df, name):
     return path.relative_to(OUTPUT_DIR)
 
 
+def weighted_std(values, weights):
+    """Volume-weighted standard deviation. Used to compare "how much spread
+    is there in bad_review_rate across groups" between different groupings
+    (seller vs. category) on a like-for-like basis -- an unweighted min-max
+    spread is misleading when group sizes vary a lot, since a single
+    small-n group can swing min-max without representing much order volume."""
+    avg = np.average(values, weights=weights)
+    return np.sqrt(np.average((values - avg) ** 2, weights=weights))
+
+
 class Report:
     """Accumulates markdown sections in order, written out at the end."""
     def __init__(self):
@@ -252,13 +262,10 @@ def section_seller_variance(df, raw, report: Report):
         spread = qualified["bad_review_rate"].max() - qualified["bad_review_rate"].min()
         report.p(f"\n- Seller bad_review_rate spread (min-max, n_orders>={MIN_ORDERS}): {spread*100:.1f} pp "
                   f"across {len(qualified):,} qualifying sellers")
-        weighted_std = np.sqrt(np.average(
-            (qualified["bad_review_rate"] - np.average(qualified["bad_review_rate"], weights=qualified["n_orders"])) ** 2,
-            weights=qualified["n_orders"]
-        ))
-        report.p(f"- Volume-weighted std of seller bad_review_rate: {weighted_std*100:.2f} pp "
-                  "(compare to the category-level spread in section 5 -- whichever grouping has "
-                  "the larger weighted std carries more distinguishing signal)")
+        weighted_std_val = weighted_std(qualified["bad_review_rate"].values, qualified["n_orders"].values)
+        report.p(f"- Volume-weighted std of seller bad_review_rate: {weighted_std_val*100:.2f} pp "
+                  "(see section 5 for the matching category-level figure, computed the same way -- "
+                  "directly comparable)")
 
     # concentration / Pareto: what share of TOTAL bad reviews (within the
     # qualifying set) comes from the worst decile of sellers by rate?
@@ -320,7 +327,14 @@ def section_category_variance(df, report: Report):
                   f"n={cat_stats['n_orders'].iloc[-1]})")
         spread = cat_stats["bad_review_rate"].max() - cat_stats["bad_review_rate"].min()
         report.p(f"- Spread (max-min bad_review_rate across categories): {spread*100:.1f} pp -- "
-                  "a wide spread suggests category carries real signal; a narrow one suggests it doesn't.")
+                  "a wide spread suggests category carries real signal; a narrow one suggests it doesn't. "
+                  "Note: min-max is sensitive to small-n categories near the n>=30 cutoff; see the "
+                  "weighted-std figure below for a more robust comparison.")
+        cat_weighted_std = weighted_std(cat_stats["bad_review_rate"].values, cat_stats["n_orders"].values)
+        report.p(f"- Volume-weighted std of category bad_review_rate: {cat_weighted_std*100:.2f} pp "
+                  "(directly comparable to the seller-level figure in section 4, same method -- "
+                  "whichever grouping has the larger weighted std carries more distinguishing signal "
+                  "per unit of order volume)")
 
     fig, ax = plt.subplots(figsize=(6, 8))
     top = pd.concat([cat_stats.head(10), cat_stats.tail(10)])
