@@ -140,7 +140,7 @@ def calibration_table(y_true, y_score, n_bins=10) -> pd.DataFrame:
 def hgb_permutation_importance(pipeline, X_test, y_test, feature_names) -> pd.DataFrame:
     result = permutation_importance(
         pipeline, X_test, y_test, scoring="average_precision",
-        n_repeats=10, random_state=RANDOM_STATE, n_jobs=-1,
+        n_repeats=10, random_state=RANDOM_STATE, n_jobs=1,
     )
     return pd.DataFrame({
         "feature": feature_names,
