@@ -11,12 +11,14 @@ Outputs (under output/model/):
                                      calibration -- numbers only, no
                                      conclusions (see docs/ once written)
     feature_importance.png
-    hgb_permutation_importance.csv  permutation importance (test set)
+    permutation_importance.csv      permutation importance (test set, shipped model)
     lr_coefficients.csv             logistic regression standardized coefficients
-    calibration.png                 reliability diagram (HGB)
+    calibration.png                 reliability diagram (shipped model)
     test_predictions.csv            order-level scored test set
     seller_risk_table.csv           current (non point-in-time) seller risk ranking
-    model.joblib                    fitted HGB pipeline
+    model.joblib                    fitted pipeline of the shipped model (HGB by
+                                     default; random_forest if it clears the
+                                     decision rule -- see build_pipelines())
 
 Evaluated primarily on RANKING quality (ROC-AUC / PR-AUC / precision@k), per
 docs/problem_framing.md section 3 -- this is a ~14.7%-positive-rate
@@ -34,7 +36,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LogisticRegression
@@ -50,18 +52,35 @@ OUTPUT_DIR = Path(__file__).resolve().parents[2] / "output" / "model"
 CATEGORICAL_COLS = ["primary_category", "primary_payment_type", "customer_state", "purchase_season"]
 NUMERIC_COLS = [c for c in ALLOWED_FEATURE_COLUMNS if c not in CATEGORICAL_COLS]
 
-K_TOP_FRACTIONS = [0.05, 0.10, 0.20]
+K_TOP_FRACTIONS = [0.01, 0.05, 0.10, 0.20]
 RANDOM_STATE = 42
 
+# Decision rule for whether random_forest replaces HGB as the shipped model
+# (see docs/modeling_findings.md "Random forest cross-check"): RF only ships
+# if it beats HGB's PR-AUC by >= RF_PR_AUC_MARGIN (the smallest real jump
+# already seen between rungs: LR-over-seller_heuristic was +0.016), holds
+# recall@20%, and keeps brier_score <= RF_MAX_BRIER -- guarding against the
+# same class-weight-driven calibration collapse that ruled out
+# logistic_regression despite its competitive ranking metrics.
+DEFAULT_SHIP = "hist_gradient_boosting"
+RF_PR_AUC_MARGIN = 0.015
+RF_MAX_BRIER = 0.105
 
-def build_pipelines():
-    """Two fitted-model candidates, both consuming the same raw feature
-    columns via their own ColumnTransformer -- HGB gets native categorical
-    handling (ordinal-encoded, negative unknown/missing sentinels never
-    actually occur since these are fixed, dataset-wide category vocabularies
-    with no missing categoricals in the feature table), LR gets the standard
+
+def build_pipelines() -> dict:
+    """Fitted-model candidates, all consuming the same raw feature columns
+    via their own ColumnTransformer. HGB gets native categorical handling
+    (ordinal-encoded, negative unknown/missing sentinels never actually
+    occur since these are fixed, dataset-wide category vocabularies with no
+    missing categoricals in the feature table). LR gets the standard
     one-hot + impute + scale treatment since it can't handle either
-    categoricals or NaN natively."""
+    categoricals or NaN natively. random_forest reuses HGB's ordinal
+    encoding (trees don't need one-hot) plus a median imputer, since unlike
+    HGB it can't accept NaN natively (customer_seller_distance_km has real
+    missingness -- see src/features/build_features.py). ExtraTrees would be
+    a one-line variant of the same pipeline but isn't added here -- a second
+    bagging candidate that only differs in split randomness doesn't earn
+    its keep as a distinct check."""
     hgb_pre = ColumnTransformer([
         ("cat", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1), CATEGORICAL_COLS),
         ("num", "passthrough", NUMERIC_COLS),
@@ -85,7 +104,23 @@ def build_pipelines():
     lr_clf = LogisticRegression(max_iter=1000, class_weight="balanced", random_state=RANDOM_STATE)
     lr_pipeline = Pipeline([("pre", lr_pre), ("clf", lr_clf)])
 
-    return hgb_pipeline, lr_pipeline
+    rf_pre = ColumnTransformer([
+        ("cat", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1), CATEGORICAL_COLS),
+        ("num", SimpleImputer(strategy="median"), NUMERIC_COLS),
+    ])
+    rf_clf = RandomForestClassifier(
+        n_estimators=500,
+        class_weight="balanced_subsample",
+        random_state=RANDOM_STATE,
+        n_jobs=1,
+    )
+    rf_pipeline = Pipeline([("pre", rf_pre), ("clf", rf_clf)])
+
+    return {
+        "logistic_regression": lr_pipeline,
+        "hist_gradient_boosting": hgb_pipeline,
+        "random_forest": rf_pipeline,
+    }
 
 
 def evaluate_scores(y_true, y_score, name) -> dict:
@@ -137,7 +172,7 @@ def calibration_table(y_true, y_score, n_bins=10) -> pd.DataFrame:
     return grp.reset_index()
 
 
-def hgb_permutation_importance(pipeline, X_test, y_test, feature_names) -> pd.DataFrame:
+def permutation_importance_table(pipeline, X_test, y_test, feature_names) -> pd.DataFrame:
     result = permutation_importance(
         pipeline, X_test, y_test, scoring="average_precision",
         n_repeats=10, random_state=RANDOM_STATE, n_jobs=1,
@@ -218,39 +253,50 @@ def main():
     results.append(evaluate_scores(y_test, seller_score, "seller_heuristic"))
     predictions["seller_heuristic_score"] = seller_score
 
-    hgb_pipeline, lr_pipeline = build_pipelines()
-
-    print("[model] Fitting logistic regression...")
-    lr_pipeline.fit(X_train, y_train)
-    lr_score = lr_pipeline.predict_proba(X_test)[:, 1]
-    results.append(evaluate_scores(y_test, lr_score, "logistic_regression"))
-    predictions["logistic_regression_score"] = lr_score
-
-    print("[model] Fitting HistGradientBoostingClassifier...")
-    hgb_pipeline.fit(X_train, y_train)
-    hgb_score = hgb_pipeline.predict_proba(X_test)[:, 1]
-    results.append(evaluate_scores(y_test, hgb_score, "hist_gradient_boosting"))
-    predictions["hgb_score"] = hgb_score
-    predictions["risk_decile"] = pd.qcut(hgb_score, 10, labels=False, duplicates="drop")
+    pipelines = build_pipelines()
+    fitted, scores = {}, {}
+    for name, pipe in pipelines.items():
+        print(f"[model] Fitting {name}...")
+        pipe.fit(X_train, y_train)
+        score = pipe.predict_proba(X_test)[:, 1]
+        results.append(evaluate_scores(y_test, score, name))
+        predictions[f"{name}_score"] = score
+        fitted[name] = pipe
+        scores[name] = score
 
     metrics_df = pd.DataFrame(results)
 
     order_value_test = (test["total_item_price"].fillna(0) + test["total_freight_value"].fillna(0)).values
     pr_at_k = {
         name: precision_recall_at_k(y_test.values, score, K_TOP_FRACTIONS, order_value_test)
-        for name, score in [
-            ("seller_heuristic", seller_score),
-            ("logistic_regression", lr_score),
-            ("hist_gradient_boosting", hgb_score),
-        ]
+        for name, score in {"seller_heuristic": seller_score, **scores}.items()
     }
 
-    print("[model] Computing calibration table...")
-    calib = calibration_table(y_test.values, hgb_score)
+    # Apply the pre-committed decision rule (see constants above
+    # build_pipelines()): does random_forest earn the shipped-model slot
+    # away from HGB, or does it stay a documented-but-not-shipped cross-check?
+    metrics_by_name = metrics_df.set_index("model")
+    hgb_row, rf_row = metrics_by_name.loc["hist_gradient_boosting"], metrics_by_name.loc["random_forest"]
+    recall20 = {n: pr_at_k[n].set_index("k_pct").loc[20, "recall"] for n in ("hist_gradient_boosting", "random_forest")}
+    rf_beats_pr_auc = rf_row["pr_auc"] >= hgb_row["pr_auc"] + RF_PR_AUC_MARGIN
+    rf_holds_recall20 = recall20["random_forest"] >= recall20["hist_gradient_boosting"]
+    rf_calibration_ok = rf_row["brier_score"] <= RF_MAX_BRIER
+    rf_ships = rf_beats_pr_auc and rf_holds_recall20 and rf_calibration_ok
+    shipped_name = "random_forest" if rf_ships else DEFAULT_SHIP
+    shipped_pipeline, shipped_score = fitted[shipped_name], scores[shipped_name]
+    print(f"[model] Decision rule: random_forest {'ships' if rf_ships else 'does not ship'} "
+          f"(PR-AUC gain {rf_row['pr_auc'] - hgb_row['pr_auc']:+.4f}, "
+          f"recall@20 {'held' if rf_holds_recall20 else 'regressed'}, "
+          f"brier {rf_row['brier_score']:.4f}). Shipping: {shipped_name}.")
 
-    print("[model] Computing permutation importance (HGB, test set)...")
-    imp = hgb_permutation_importance(hgb_pipeline, X_test, y_test, feature_cols)
-    coefs = lr_coefficients(lr_pipeline)
+    predictions["risk_decile"] = pd.qcut(shipped_score, 10, labels=False, duplicates="drop")
+
+    print("[model] Computing calibration table...")
+    calib = calibration_table(y_test.values, shipped_score)
+
+    print(f"[model] Computing permutation importance ({shipped_name}, test set)...")
+    imp = permutation_importance_table(shipped_pipeline, X_test, y_test, feature_cols)
+    coefs = lr_coefficients(fitted["logistic_regression"])
 
     print("[model] Building current seller risk table...")
     seller_risk_table = build_current_seller_risk_table(raw, order_df)
@@ -259,22 +305,22 @@ def main():
 
     predictions.to_csv(OUTPUT_DIR / "test_predictions.csv", index=False)
     seller_risk_table.to_csv(OUTPUT_DIR / "seller_risk_table.csv", index=False)
-    imp.to_csv(OUTPUT_DIR / "hgb_permutation_importance.csv", index=False)
+    imp.to_csv(OUTPUT_DIR / "permutation_importance.csv", index=False)
     coefs.to_csv(OUTPUT_DIR / "lr_coefficients.csv", index=False)
-    joblib.dump(hgb_pipeline, OUTPUT_DIR / "model.joblib")
+    joblib.dump(shipped_pipeline, OUTPUT_DIR / "model.joblib")
 
     fig, ax = plt.subplots(figsize=(6, 5))
     top_imp = imp.head(15).sort_values("importance_mean")
     ax.barh(top_imp["feature"], top_imp["importance_mean"], xerr=top_imp["importance_std"], color="#4C72B0")
     ax.set_xlabel("Permutation importance (avg. precision drop)")
-    ax.set_title("HGB feature importance (test set)")
+    ax.set_title(f"{shipped_name} feature importance (test set)")
     fig.tight_layout()
     fig.savefig(OUTPUT_DIR / "feature_importance.png", bbox_inches="tight")
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(5, 5))
     ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="perfect calibration")
-    ax.plot(calib["mean_predicted"], calib["mean_actual"], marker="o", color="#C44E52", label="HGB")
+    ax.plot(calib["mean_predicted"], calib["mean_actual"], marker="o", color="#C44E52", label=shipped_name)
     ax.set_xlabel("Mean predicted probability")
     ax.set_ylabel("Mean actual bad_review rate")
     ax.set_title("Calibration (test set, by predicted-risk decile)")
@@ -287,6 +333,7 @@ def main():
     lines.append(f"\nTrain: {len(train):,} orders, Test: {len(test):,} orders "
                  f"(time-based split -- see `output/features/schema.md`).\n")
     lines.append(f"\nPositive rate: train {y_train.mean()*100:.2f}%, test {y_test.mean()*100:.2f}%.\n")
+    lines.append(f"\nShipped model: **{shipped_name}** (see decision rule constants in `src/models/train_model.py`).\n")
 
     lines.append("\n## Model comparison (test set)\n")
     lines.append(df_to_md_table(metrics_df))
@@ -300,16 +347,16 @@ def main():
         lines.append(f"\n**{name}**\n")
         lines.append(df_to_md_table(tbl))
 
-    lines.append("\n## Calibration (HGB, by predicted-risk decile)\n")
+    lines.append(f"\n## Calibration ({shipped_name}, by predicted-risk decile)\n")
     lines.append(df_to_md_table(calib))
 
     lines.append("\n## Artifacts\n")
-    lines.append("- `feature_importance.png` / `hgb_permutation_importance.csv` -- HGB permutation importance (test set, scored on average precision)")
+    lines.append(f"- `feature_importance.png` / `permutation_importance.csv` -- {shipped_name} permutation importance (test set, scored on average precision)")
     lines.append("- `lr_coefficients.csv` -- logistic regression standardized coefficients (interpretability cross-check)")
     lines.append("- `calibration.png` -- reliability diagram")
     lines.append("- `test_predictions.csv` -- order-level scored test set (all candidate models' scores + risk decile)")
     lines.append("- `seller_risk_table.csv` -- current (non point-in-time) seller risk ranking, secondary deliverable per docs/problem_framing.md section 3")
-    lines.append("- `model.joblib` -- fitted HGB pipeline")
+    lines.append(f"- `model.joblib` -- fitted {shipped_name} pipeline")
 
     (OUTPUT_DIR / "metrics.md").write_text("\n".join(lines))
 

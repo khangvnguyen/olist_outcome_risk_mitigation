@@ -36,13 +36,14 @@ of a bad customer experience." I operationalised "bad outcome" as
 `bad_review` (`review_score <= 2`, ~14.7% of reviewed orders), deliberately
 **not** blending in lateness or cancellation -- EDA showed those are only
 distantly related to review score (most bad reviews happen on on-time
-orders), so a composite target would obscure more than it reveals. The
-resulting task: an order-level risk score, using only information available
-at/near order time (no post-outcome leakage), that Ops can use to
-**prioritize a limited pool of interventions** during the fulfillment
-window -- evaluated on ranking quality, not raw accuracy, since that's what
-"useful to a triage team" means at a ~15% positive rate. Full reasoning:
-`docs/problem_framing.md`.
+orders), so a composite target would obscure more than it reveals.
+The resulting task: build an order-level risk score, 
+using only information available at/near order time, that Ops can use to prioritize a limited pool
+of interventions during the fulfillment window. I report ROC-AUC/PR-AUC as
+general ranking diagnostics, but the business-facing evaluation is
+precision/recall@k: if Ops can only act on the riskiest 1%, 5%, 10%, or 20%
+of orders, how many bad outcomes and how much bad-review order value do we
+catch? Full reasoning: `docs/problem_framing.md`.
 
 ## Key findings
 
@@ -53,11 +54,11 @@ window -- evaluated on ranking quality, not raw accuracy, since that's what
   ~6x's the per-order risk (~54% vs. ~9%) but is only a partial lever;
   review text points to product-mismatch/defect complaints as the other
   major driver, which no structured column captures.
-- **The model works, modestly:** HistGradientBoostingClassifier reaches
-  PR-AUC 0.197 vs. a 0.109 no-model baseline, catching **33% of bad reviews
-  (48% of their order value) by flagging the riskiest 20% of orders** --
-  beating a "rank by seller history" heuristic only moderately, since that
-  heuristic alone already captures most of the signal
+- **The model works, modestly:** a HistGradientBoostingClassifier reaches
+  PR-AUC 0.197 vs. a 0.109 no-model baseline. More importantly for Ops,
+  at the top-20% risk threshold it achieves ~18% precision and ~33% recall,
+  capturing **48% of bad-review order value**. It beats a "just rank by
+  seller history" heuristic, but only by a moderate margin.
   (`docs/modeling_findings.md`).
 - **Calibration drifts over time** (train positive rate 15.6% vs. test
   10.9%) -- a real base-rate shift, not a bug. Use the score to *rank*
@@ -78,9 +79,13 @@ window -- evaluated on ranking quality, not raw accuracy, since that's what
 - **Time-based train/test split**, not random -- honest evaluation for a
   model whose seller/product features are themselves time-dependent.
 - **HistGradientBoostingClassifier over XGBoost/LightGBM/logistic
-  regression:** native NaN/categorical handling, no new dependency, and it
-  beat logistic regression on every axis -- LR's `class_weight="balanced"`
-  improved ranking but wrecked calibration, a real tradeoff worth noting.
+  regression/random forest:** native NaN/categorical handling, no new
+  dependency, and it beat logistic regression on every axis -- LR's
+  `class_weight="balanced"` improved ranking but wrecked calibration, a
+  real tradeoff worth noting. Also tried `RandomForestClassifier` as a
+  cross-check (same features/split, pre-committed swap criteria) -- it
+  didn't beat HGB on PR-AUC or recall@20%, so HGB stays shipped
+  (`docs/modeling_findings.md`).
 - **A cheap secondary deliverable** (`output/model/seller_risk_table.csv`):
   a ranked seller risk table needing no model, since seller signal alone
   is real, if not sufficient.
