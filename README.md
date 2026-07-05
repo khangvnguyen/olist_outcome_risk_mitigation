@@ -1,5 +1,7 @@
 # Olist Outcome Risk
 
+Dataset: [The Brazilian E-Commerce Public Dataset by Olist](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce/data) — a real, anonymised dataset of ~100K orders from 2016–2018 across a Brazilian marketplace.
+
 This project asks a practical Ops question: **which orders are most likely to end in a poor customer experience, while there is still time to act?**
 
 I define a poor outcome as a 1-2 star review (`bad_review`). Late delivery and cancellations matter, but I keep them out of the target because they describe different problems. Most bad reviews in this dataset are not simply late orders.
