@@ -1,152 +1,123 @@
-# Modeling Findings (post-modeling, pre-report)
+# Modeling Findings
 
-Consolidated from `output/model/metrics.md` (auto-generated, full detail)
-plus the design decisions in `docs/problem_framing.md` section 3. This doc
-is the decision-ready reference for the final README/report write-up --
-states conclusions and why, not raw numbers (see the auto-report for
-those). Numbers below are all on the held-out, time-based test split
-(19,735 orders, positive rate 10.90%; train positive rate 15.62% -- see
-"Calibration" below for why that gap matters).
+This note summarizes the modeling results and the final model choice. The full generated metrics are in `output/model/metrics.md`.
 
-## Model comparison (confirmed)
+All numbers below are from the held-out, time-based test split:
 
-| model | roc_auc | pr_auc | brier_score |
-|---|---|---|---|
-| constant_baseline | 0.500 | 0.109 | 0.099 |
-| seller_heuristic (rank by seller history alone) | 0.592 | 0.156 | 0.097 |
-| logistic_regression | 0.608 | 0.172 | **0.217** |
-| hist_gradient_boosting | 0.620 | 0.197 | 0.095 |
-| random_forest | 0.613 | 0.189 | 0.096 |
+- test set: 19,735 orders
+- test bad-review rate: 10.90%
+- train bad-review rate: 15.62%
 
-**Verdict on problem_framing.md's open question ("does a multivariate model
-earn its complexity over a seller-only heuristic?"): yes, but modestly, not
-decisively.** HGB improves PR-AUC over the seller heuristic by ~0.04 (0.197
-vs. 0.156) -- a real, consistent gain, but this is not a case where the
-simple heuristic turns out to be worthless. A team with limited engineering
-capacity could ship the seller risk table alone (see below) and capture
-most of the signal.
+That train/test rate gap matters. It means the model should be treated as a ranking tool unless it is retrained or recalibrated.
 
-## Random forest cross-check (confirmed, does not change the pick)
+## Model Comparison
 
-Tried `RandomForestClassifier` (500 trees, `class_weight="balanced_subsample"`,
-same feature table and time split) as a second tabular baseline against a
-pre-committed rule: it would only replace HGB as the shipped model if it beat
-HGB's PR-AUC by >=0.015, held recall@20%, and kept Brier <=0.105. It did none
-of the first two -- PR-AUC 0.189 (below HGB's 0.197, not above), recall@20%
-0.314 vs. HGB's 0.333 -- while Brier (0.096) was fine, essentially tied with
-HGB. **HGB stays the shipped model.** This is the expected outcome, not a
-surprise: boosting typically edges out bagging on tabular data once features
-are already engineered, and permutation importance (below) shows one feature
-dominating, leaving little room for a different model family to extract more
-signal from the same columns. Kept as a documented negative result rather
-than silently dropped.
+| Model | ROC-AUC | PR-AUC | Brier score |
+|---|---:|---:|---:|
+| constant baseline | 0.500 | 0.109 | 0.099 |
+| seller heuristic | 0.592 | 0.156 | 0.097 |
+| logistic regression | 0.608 | 0.172 | 0.217 |
+| hist gradient boosting | 0.620 | 0.197 | 0.095 |
+| random forest | 0.613 | 0.189 | 0.096 |
 
-## Precision / Recall at top-k% risk (the business-facing number)
+The main question was whether a full model adds enough value over a simple seller-history ranking.
 
-| k% | model | precision | recall | bad-review order value captured |
-|---|---|---|---|---|
-| 1% | seller_heuristic | 0.305 | 0.028 | R$11.7k (2.8%) |
-| 1% | logistic_regression | 0.365 | 0.034 | **R$38.7k (9.4%)** |
-| 1% | hist_gradient_boosting | **0.518** | **0.047** | R$19.8k (4.8%) |
-| 5% | seller_heuristic | 0.219 | 0.100 | R$46.3k (11.2%) |
-| 5% | logistic_regression | **0.274** | **0.126** | **R$89.6k (21.7%)** |
-| 5% | hist_gradient_boosting | 0.264 | 0.121 | R$81.0k (19.6%) |
-| 10% | seller_heuristic | 0.176 | 0.161 | R$87.8k (21.2%) |
-| 10% | logistic_regression | **0.217** | **0.199** | **R$136.2k (32.9%)** |
-| 10% | hist_gradient_boosting | 0.210 | 0.193 | R$124.9k (30.2%) |
-| 20% | seller_heuristic | 0.151 | 0.277 | R$139.9k (33.8%) |
-| 20% | logistic_regression | 0.169 | 0.310 | R$190.7k (46.1%) |
-| 20% | hist_gradient_boosting | **0.182** | **0.333** | **R$199.6k (48.2%)** |
+The answer is **yes, but not by a huge margin**. HistGradientBoosting improves PR-AUC from 0.156 to 0.197. That is a real gain, but it also shows that the seller-only table is useful on its own.
 
-**k=1% added for a realistic "manual review" capacity** (~6,000 orders/month
--> 1% is ~60 orders/month, a plausible daily-triage load; 5% at ~300/month
-is already a lot for a human queue). At this tightest cutoff HGB has the
-best precision by a wide margin (0.518 vs. LR's 0.365) -- its top-ranked
-handful of orders are genuinely the most reliable signal in the model. But
-LR captures roughly **2x the R$ value** at the same 1% (R$38.7k vs.
-R$19.8k), because the specific orders each model ranks highest differ in
-average order value, not just in hit rate -- HGB's top 1% catches more
-individually-cheap bad orders, LR's catches fewer but pricier ones. Which
-matters more depends on whether Ops optimizes for order count or R$ at risk;
-neither model dominates at this cutoff.
+## Business View: Precision and Recall at Top Risk Bands
 
-**Honest nuance, not smoothed over:** no single model wins at every
-operating point. Logistic regression is narrowly *better* than HGB at the
-tightest 5%/10% cutoffs (and on $-value at 1%); HGB only pulls ahead on
-value captured once Ops can act on a larger 20% pool, though it's the
-precision leader at 1%. If the real intervention capacity turns out to be
-very small (e.g. a small Ops team that can only chase ~1-5% of orders),
-this would be worth re-checking rather than assuming HGB is uniformly best.
+Ops will not act on every order. The useful question is: if the team reviews the highest-risk 1%, 5%, 10%, or 20% of orders, how many bad outcomes do we catch?
 
-## Why logistic regression isn't the one to ship despite the table above
+| Top risk band | Model | Precision | Recall | Bad-review order value captured |
+|---|---|---:|---:|---:|
+| 1% | seller heuristic | 0.305 | 0.028 | R$11.7k (2.8%) |
+| 1% | logistic regression | 0.365 | 0.034 | **R$38.7k (9.4%)** |
+| 1% | hist gradient boosting | **0.518** | **0.047** | R$19.8k (4.8%) |
+| 5% | seller heuristic | 0.219 | 0.100 | R$46.3k (11.2%) |
+| 5% | logistic regression | **0.274** | **0.126** | **R$89.6k (21.7%)** |
+| 5% | hist gradient boosting | 0.264 | 0.121 | R$81.0k (19.6%) |
+| 10% | seller heuristic | 0.176 | 0.161 | R$87.8k (21.2%) |
+| 10% | logistic regression | **0.217** | **0.199** | **R$136.2k (32.9%)** |
+| 10% | hist gradient boosting | 0.210 | 0.193 | R$124.9k (30.2%) |
+| 20% | seller heuristic | 0.151 | 0.277 | R$139.9k (33.8%) |
+| 20% | logistic regression | 0.169 | 0.310 | R$190.7k (46.1%) |
+| 20% | hist gradient boosting | **0.182** | **0.333** | **R$199.6k (48.2%)** |
 
-LR's Brier score (0.217) is **worse than the constant baseline** (0.099),
-even though its ranking metrics look competitive. Cause: `class_weight="balanced"`
-was used to counter the ~15% positive rate, which measurably helps ranking
-but pushes `predict_proba` outputs away from the true prevalence --
-a textbook ranking-vs-calibration tradeoff. This is exactly why
-problem_framing.md commits to reporting calibration as its own axis rather
-than inferring it from AUC: a model can look good on one and be unusable on
-the other. **HGB is the one to ship** -- it's competitive-to-best on every
-axis (ROC-AUC, PR-AUC, Brier, and the 20% cutoff) without needing a
-calibration-distorting class weight; LR stays in the pipeline only as an
-interpretability cross-check.
+The model choice depends a little on capacity:
 
-## What drives the model (permutation importance, HGB, test set)
+- At the tightest 1% cutoff, HistGradientBoosting has the best precision: 51.8%.
+- At 5% and 10%, logistic regression is slightly better on precision, recall, and value captured.
+- At 20%, HistGradientBoosting is best on precision, recall, and bad-review value captured.
 
-Ranked: `seller_bad_review_rate_smoothed` (0.044) >> `total_freight_value`
-(0.020) > `primary_category` (0.006) > `total_item_price` (0.004) >
-`estimated_delivery_days` (0.004) > `product_bad_review_rate_smoothed`
-(0.002) > `seller_late_rate_smoothed` (0.002) > everything else (noise
-level, including `customer_state` and `customer_seller_distance_km`).
+For this project I ship HistGradientBoosting because it is the best all-around choice. It has the strongest PR-AUC, the best Brier score among the learned models, and the best 20% operating point. Still, if Ops could only review 1-5% of orders, I would re-check the model choice against the exact intervention goal.
 
-**Interpretation:** broadly consistent with the EDA driver ranking (seller
-signal is strong) but with one notable shift -- **product-level history
-contributes far less than EDA's raw univariate ranking suggested**
-(product had the largest volume-weighted std in EDA section 4/5/9). Most
-likely explanation: with k=20 shrinkage toward category (needed because
-95% of products have <10 prior orders), the smoothed product feature mostly
-collapses into what `primary_category` already captures, leaving little
-independent signal once category is already in the model. Practical
-implication: **seller history + category + freight/price are the
-load-bearing features**; the extra engineering complexity of product-level
-tracking is not earning its keep at current shrinkage/coverage levels. A
-next step worth trying (not done here): a smaller shrinkage constant or a
-product-embedding approach for the ~5% of products with real history,
-rather than shrinking all products uniformly.
+## Why Not Logistic Regression?
 
-## Calibration: a real limitation, not a bug to silently fix
+Logistic regression ranks orders reasonably well, but its probabilities are poorly calibrated.
 
-Predicted probabilities run above actual rates across every decile (e.g.
-top decile predicts 30.8% but realizes 21.0%). Root cause: the train-period
-bad_review rate (15.6%) is meaningfully higher than the test-period rate
-(10.9%) -- a genuine temporal decline already visible in EDA section 8's
-monthly trend, not a modeling error. **Practical implication: if deployed
-as-is, raw HGB probability outputs would systematically overstate risk in
-the current period.** The model should be used as a *ranking* device
-(which is what's evaluated and recommended -- precision/recall@k), not read
-as a literal probability, until it's retrained on more recent data or
-wrapped in a periodic recalibration step. Flagged as a next step, not
-silently absorbed into "the model works."
+Its Brier score is **0.217**, worse than the constant baseline at **0.099**. The reason is `class_weight="balanced"`: it helps ranking on an imbalanced target, but it pushes predicted probabilities away from the true bad-review rate.
 
-## Seller risk table cross-check (secondary deliverable)
+That tradeoff matters here. I want the shipped model to rank well without producing probability scores that are obviously misleading. Logistic regression stays useful as a comparison point, but it is not the final model.
 
-`output/model/seller_risk_table.csv` (full-dataset, non-point-in-time,
-same k=20 shrinkage) surfaces the same worst offenders as EDA's
-`output/eda/tables/worst_20_sellers.csv` (e.g. sellers `4342d4b2...`,
-`b1b39487...` appear at the top of both). Consistent signal across two
-independently-computed views gives confidence the shrinkage isn't
-distorting the ranking -- this table is cheap, requires no model, and is
-directly actionable for Ops on its own.
+## Random Forest Check
 
-## Net verdict / what ships
+I also tested `RandomForestClassifier` as a second non-linear baseline.
 
-- **Primary deliverable:** the HGB risk score, used and evaluated as a
-  *ranking* tool (precision/recall@k), not a calibrated probability.
-- **Secondary deliverable:** the current seller risk table -- cheap,
-  interpretable, and directly actionable independent of the classifier.
-- **Explicitly not pursued (stated, not hidden):** recalibration/rolling
-  retraining to fix the temporal drift; a stricter outcome-resolution-time
-  cutoff (already flagged as a simplification in
-  `src/features/build_features.py`); hyperparameter tuning beyond sklearn
-  defaults + early stopping; alternative product-level shrinkage schemes.
+The pre-set rule was: replace HistGradientBoosting only if random forest improved PR-AUC by at least 0.015, kept recall@20%, and kept Brier score at or below 0.105.
+
+It did not meet that bar:
+
+- PR-AUC: 0.189 vs. 0.197 for HistGradientBoosting
+- recall@20%: 0.314 vs. 0.333
+- Brier score: 0.096 vs. 0.095
+
+Random forest is close, but it does not change the final choice.
+
+## What Drives the Model?
+
+Permutation importance on the test set points to the following order:
+
+| Feature | Importance |
+|---|---:|
+| `seller_bad_review_rate_smoothed` | 0.044 |
+| `total_freight_value` | 0.020 |
+| `primary_category` | 0.006 |
+| `total_item_price` | 0.004 |
+| `estimated_delivery_days` | 0.004 |
+| `product_bad_review_rate_smoothed` | 0.002 |
+| `seller_late_rate_smoothed` | 0.002 |
+
+Everything else is near noise level, including `customer_state` and `customer_seller_distance_km`.
+
+The biggest shift from EDA is product history. Product-level bad-review rate looked very strong on its own, but it contributes much less after smoothing and after category is already in the model.
+
+The likely reason is coverage. Most products have very few prior orders, so the smoothed product feature gets pulled toward the category average. This is safer than overfitting rare products, but it also reduces the product feature's independent signal.
+
+Practical read: **seller history, category, freight, and price carry most of the model.** Product-level tracking may still be useful, but it needs better treatment before it earns much complexity.
+
+## Calibration
+
+The model overstates risk across the score range. For example, the top decile predicts about 30.8% bad reviews but realizes about 21.0%.
+
+This is not just a modeling bug. The train period has a 15.6% bad-review rate, while the test period has 10.9%. The base rate changed over time.
+
+For deployment, this means:
+
+- use the score to rank orders
+- avoid treating the score as an exact probability
+- retrain or recalibrate on a rolling schedule before production use
+
+## Seller Risk Table
+
+The pipeline also outputs `output/model/seller_risk_table.csv`.
+
+This table is not point-in-time and is not a replacement for the order-level model, but it is useful for Ops. It ranks sellers by smoothed bad-review rate and surfaces the same high-risk sellers seen in EDA, including sellers such as `4342d4b2...` and `b1b39487...`.
+
+The seller table is cheap, easy to explain, and actionable even if the classifier is not deployed yet.
+
+## Final Recommendation
+
+- Ship the HistGradientBoosting score as an **order ranking tool**.
+- Do not present its raw score as a calibrated probability.
+- Include the seller risk table as a simple secondary deliverable.
+- Revisit calibration, product-history smoothing, and exact model choice once the real Ops capacity and intervention cost are known.

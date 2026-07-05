@@ -1,148 +1,102 @@
-# EDA Findings Summary (post-EDA, pre-modeling)
+# EDA Findings
 
-Consolidated from `output/eda/summary.md` (auto-generated, full detail) plus
-the interpretation/back-and-forth in `docs/problem_framing.md`. This doc is
-the decision-ready reference for the feature engineering and modeling
-stages — it states conclusions and why, not raw numbers (see the auto-report
-for those).
+This note summarizes the EDA results that shaped the feature plan and model design. The full generated report is in `output/eda/summary.md`; this file focuses on the conclusions and why they matter.
 
-## Target (confirmed)
+## Target
 
-`bad_review` = review_score <= 2. ~14.7% positive rate. `is_late` and
-`is_canceled_or_unavailable` are diagnostic, not part of the target (see
-`problem_framing.md` section 1 for why).
+The main target is:
 
-## What actually predicts bad_review — ranked by signal strength
+```text
+bad_review = review_score <= 2
+```
 
-Measured consistently via volume-weighted std of bad_review_rate across
-groups (comparable across groupings, see `output/eda/summary.md` sections
-4/5/9):
+This gives a positive rate of about **14.7%**.
 
-| Grouping | Volume-weighted std | Note |
-|---|---|---|
-| Product | ~9.9 pp | Strongest signal found, but only 42% of order volume has enough history (>=10 orders) per product to trust it -- needs shrinkage, see below |
-| Seller | ~7.2 pp | Second strongest; 94% of volume has enough history (>=10 orders); no seller-experience effect (volume vs. rate correlation ~0) |
-| Customer state | ~3.1 pp | Real signal on large-n states (RJ ~21% vs. SP ~13%, both n>10k -- credible). Small-n states (RR, AP) at the "worst/best" extremes are noise, not signal -- don't lead with those. |
-| Category | ~2.3 pp | Real but modest |
-| Seller state | ~1.1 pp | Weak. Customer-side geography matters more than seller-side. |
-| Distance (km) | ~0 (r=0.046 with bad_review) | Not worth much modeling complexity |
+Late delivery and cancellations are important diagnostics, but they are not part of the target. They describe different failure modes, and combining them with low reviews would make the model harder to interpret. The target decision is explained in more detail in `docs/problem_framing.md`.
 
-**Seller-state -> customer-state "lane" effects:** the worst lane found
-(PR->CE) is likely just re-detecting the customer-state effect (CE is a
-mid-table state) rather than a genuine route-specific effect. Not pursued
-further -- customer state alone is the more defensible feature.
+## Main Drivers of Bad Reviews
 
-## Lateness (diagnostic, not a feature)
+I compared group-level bad-review rates using volume-weighted standard deviation. In plain terms: groups with larger values show more separation between good and bad outcomes, while giving more weight to groups with enough order volume to trust.
 
-Late delivery is a strong per-order risk multiplier (~54% bad_review rate
-when late vs. ~9% on-time) but explains only ~34% of total bad reviews,
-since only ~8% of orders are late. **The majority of bad reviews (66%)
-happen on orders that arrived on time** -- delivery performance is a real
-but partial lever. `is_late` itself is leakage (only known post-delivery)
-and cannot be a model input; the actionable version is a seller's
-**historical** on-time rate (point-in-time cutoff), used as a proxy.
+| Grouping | Volume-weighted std | Read |
+|---|---:|---|
+| Product | ~9.9 pp | Strongest raw signal, but sparse. Only 42% of order volume has at least 10 prior orders per product, so product history needs smoothing. |
+| Seller | ~7.2 pp | Second strongest signal. Seller history is more stable because 94% of order volume has at least 10 prior orders per seller. |
+| Customer state | ~3.1 pp | Real signal in large states, for example RJ around 21% vs. SP around 13%. Small states at the extremes are mostly noise. |
+| Category | ~2.3 pp | Useful, but not dominant. |
+| Seller state | ~1.1 pp | Weak. Customer geography matters more than seller geography. |
+| Distance | ~0 | Very weak relationship with bad reviews (`r=0.046`). |
 
-## Business impact
+I also checked seller-to-customer route effects. The worst lane found was likely just picking up the customer-state effect again, not a reliable route-specific pattern. I did not carry route-level features forward.
 
-- **Revenue at risk:** bad-review orders account for a slightly
-  *higher* share of order value (16.8%) than their share of order count
-  (14.2%) -- bad reviews skew mildly toward higher-value orders. Small but
-  consistent with the price/freight finding in section 6.
-- **Repurchase/churn:** inconclusive by design, not by finding. Olist's
-  baseline repeat-purchase rate is very low (~4%) across the board, which
-  leaves little statistical room for a first-order-experience effect to
-  show up in a simple before/after comparison (observed gap ~R$0.16/customer,
-  not distinguishable from noise). **Honest conclusion: this dataset/method
-  cannot demonstrate a churn cost of bad reviews** -- would need either a
-  matched/causal design or a longer post-period than this snapshot allows.
-  Not pursued further; stated as a limitation, not glossed over.
+## Lateness
 
-## Qualitative signal (bad reviews on on-time orders)
+Late delivery is a strong risk signal for a single order:
 
-Word-frequency and sample review of the 66% "unexplained by lateness"
-segment (`output/eda/tables/bad_ontime_review_word_frequency.csv` and
-`..._sample.csv`) point toward product-mismatch/defect complaints (wrong
-item, damaged, different from photo) rather than logistics. This is
-consistent with -- and helps explain *why* -- product-level signal (above)
-is the strongest grouping found. Not usable as a model feature (text is
-post-outcome), but supports prioritizing product-level features and
-explains the ceiling on how much delivery-focused fixes alone can help.
+- about **54%** of late orders receive a bad review
+- about **9%** of on-time orders receive a bad review
 
-**Confirmed with real labels, not just word frequency:** `src/nlp/categorize_reviews.py`
-ran an LLM pass (`google/gemini-2.5-flash`) assigning each negative review
-with comment text (10,830 / 14,484 bad reviews, 74.8% -- the rest have no
-comment at all) one of 8 complaint categories (`output/nlp/summary.md`).
-Joined back onto the order table (`output/eda/summary.md` section 13):
+But late delivery explains only part of the problem. Only about 8% of orders are late, so late orders account for about **34%** of all bad reviews. The other **66%** happen on orders that arrive on time.
 
-- **On-time bad reviews are dominated by fulfillment-accuracy complaints,
-  not product-quality complaints as the word list alone suggested:**
-  `Incomplete Order / Missing Items` (25.5%) and `Wrong Item Delivered /
-  Product Divergence` (19.3%) together are ~45% of on-time bad reviews,
-  ahead of `Damaged or Broken Product` (12.5%) and `Poor Quality` (11.6%).
-  Refines the earlier read -- "product-mismatch" is real, but it's mostly
-  *the wrong/incomplete thing arriving*, not the product itself being low
-  quality.
-- **Validation check:** of reviews the LLM labeled `Late Delivery or
-  Non-Delivery`, only 70.7% were actually late by the structured `is_late`
-  field. `is_late` is a real signal but an imperfect proxy for
-  delivery-related dissatisfaction -- ~30% of "late" complaints describe an
-  experience the estimated-date threshold doesn't capture (e.g. tracking
-  anxiety before the deadline, non-delivery within an on-time window).
-- **Complaint type varies sharply by product category:** `Damaged or Broken
-  Product` concentrates in `office_furniture` (19.7%), `furniture_living_room`
-  (17.8%), `audio` (17.3%) -- physically fragile/bulky goods, as expected.
-  `Wrong Item Delivered` concentrates in `home_appliances` (32.9%),
-  `telephony` (21.5%), `small_appliances` (20.6%) -- categories with many
-  similar SKU variants (model/voltage/color), consistent with a
-  picking/listing-accuracy problem rather than damage-in-transit.
-- Median order value is highest for `Incomplete Order / Missing Items`
-  (R$183) and lowest for `Poor Quality / Below Expectations` (R$96) --
-  weak evidence that missing-item complaints skew toward
-  higher-value/multi-item orders, where a partial short-ship is more likely.
+This means delivery performance matters, but it is not the whole story. Also, `is_late` itself cannot be a model feature because it is only known after delivery. The usable version is historical seller delivery performance, computed only from orders before the order being scored.
 
-## Feature plan for modeling (carried into src/features/)
+## Business Impact
 
-**Include, with point-in-time cutoffs (only using history prior to the
-order being scored) for seller and product features specifically:**
-- Order-level: category, item price, freight value, payment type,
-  installments, customer state, distance (low expected value, cheap to
-  include)
-- Seller history: smoothed historical bad-review rate, smoothed historical
-  late-delivery rate, order volume-to-date
-- Product history: smoothed historical bad-review rate (shrunk toward
-  category rate by sample size -- see reasoning below), order volume-to-date
-- Time: purchase month/season
+- **Order value:** bad-review orders represent 14.2% of order count but 16.8% of order value. Bad reviews skew slightly toward higher-value orders.
+- **Repurchase / churn:** this dataset is not enough to prove churn impact. Olist's repeat-purchase rate is only around 4%, so a simple before/after comparison has very little power. The observed gap is about R$0.16 per customer, which is not meaningful enough to treat as evidence. A churn estimate would need a longer customer history or a causal design.
 
-**Product-level feature requires shrinkage, not raw identity:**
-`smoothed_rate = (n*product_rate + k*category_rate) / (n+k)` for some
-smoothing constant k (e.g. 10-20 orders). Reasoning: 95% of the product
-catalogue has <10 prior orders, so raw per-product rates are mostly noise,
-and using raw `product_id` as a categorical directly (32,951 levels) risks
-memorization and breaks entirely on unseen products at inference. Same
-shrinkage logic optionally applies to seller history, though seller
-coverage is high enough (94%) that it matters less there.
+## What the Review Text Adds
 
-**Explicitly excluded (leakage):** `is_late`, actual delivery dates,
-`order_status` beyond early states, review score/text, seller-state
-lane effects (too weak / redundant with customer state alone).
+The 66% of bad reviews that were on-time needed more explanation. A word-frequency pass and sample review pointed toward product mismatch or defects: wrong item, damaged item, item different from the photo, and similar issues.
 
-## Open items not pursued (explicitly out of scope for now)
+I then ran a separate LLM categorization step on negative reviews with comment text:
 
-- Multi-seller order attribution (currently approximated by assigning the
-  whole order's outcome to every seller/product involved; ~2% of orders)
-- True causal estimate of churn cost (would need a different study design)
-- **Complaint categorization is not usable as a model feature** (text is
-  post-outcome, same leakage argument as the word-frequency pass) but has
-  two concrete non-modeling uses not pursued here: (1) **ops routing** --
-  category maps fairly directly onto existing functions (logistics /
-  product QA / fraud / support-refund) and could drive ticket routing; (2)
-  **category-mix drift as a seller/product quality signal** -- e.g. a
-  seller whose complaint mix shifts toward `Wrong Item Delivered` or
-  `Counterfeit` rather than `Late Delivery` points to a fulfillment-accuracy
-  or fraud problem, not a logistics one, which is a different fix than what
-  the current seller risk table (bad-review rate alone) can distinguish.
-  Both would need the categorization step folded into the regular pipeline
-  (currently a manual, paid, standalone stage -- see
-  `src/nlp/categorize_reviews.py`) and ideally extended to bad reviews
-  without comment text (currently 25% of bad reviews are invisible to this
-  analysis) to avoid survivorship bias toward customers who write something.
+- script: `src/nlp/categorize_reviews.py`
+- model: `google/gemini-2.5-flash` through OpenRouter
+- coverage: 10,830 of 14,484 bad reviews, or 74.8%
+- output: `output/nlp/summary.md`
+
+The labels clarified the story:
+
+- **On-time bad reviews are mostly fulfillment-accuracy problems.** `Incomplete Order / Missing Items` is 25.5% and `Wrong Item Delivered / Product Divergence` is 19.3%. Together they make up about 45% of on-time bad reviews.
+- **Poor product quality is not the main on-time issue.** `Damaged or Broken Product` is 12.5% and `Poor Quality` is 11.6%.
+- **The structured late flag is useful but imperfect.** Of reviews labeled `Late Delivery or Non-Delivery`, only 70.7% were late by the structured `is_late` field. Some customers complain about delivery even when the estimated-date rule says the order was on time.
+- **Complaint mix varies by category.** Damage is more common in bulky or fragile categories such as `office_furniture`, `furniture_living_room`, and `audio`. Wrong-item complaints are higher in categories with many similar variants, such as `home_appliances`, `telephony`, and `small_appliances`.
+- **Missing-item complaints skew higher value.** Median order value is R$183 for `Incomplete Order / Missing Items` versus R$96 for `Poor Quality / Below Expectations`. This is weak evidence, but it fits the idea that partial short-ships are more likely in larger or multi-item orders.
+
+Review text is post-outcome, so it is not allowed as a predictive model feature. Still, it is useful for root-cause analysis and future Ops routing.
+
+## Feature Plan
+
+Features carried into modeling:
+
+- **Order details:** category, item price, freight value, payment type, installments, customer state, distance, and estimated delivery window
+- **Seller history:** smoothed prior bad-review rate, smoothed prior late-delivery rate, and order count to date
+- **Product history:** smoothed prior bad-review rate and order count to date
+- **Time:** purchase month or season
+
+Seller and product history use point-in-time cutoffs. For each order, the feature only uses orders that happened earlier. This is important because the model is meant to predict risk before the outcome is known.
+
+Product history also needs shrinkage because most products have very little history. The smoothing formula is:
+
+```text
+smoothed_rate = (n * product_rate + k * category_rate) / (n + k)
+```
+
+This pulls low-volume products toward their category average. Without this, raw product rates would mostly be noise, and using `product_id` directly would risk memorizing rare products.
+
+## Excluded Features
+
+These are excluded because they leak future information or are too weak:
+
+- actual delivery dates
+- `is_late`
+- final review score or review text
+- final order status beyond early states
+- seller-to-customer route effects
+
+## Open Items
+
+- **Multi-seller orders:** the current approach uses a primary-item approximation. This affects only about 2% of orders, but a production system should handle item-level attribution more carefully.
+- **Churn impact:** the current dataset cannot support a strong churn estimate. This needs a causal study, matched cohorts, or a longer post-period.
+- **Review category routing:** complaint categories could help route tickets to logistics, product QA, fraud, or support. This would require folding the categorization step into the regular pipeline and finding a way to handle bad reviews with no comment text.
