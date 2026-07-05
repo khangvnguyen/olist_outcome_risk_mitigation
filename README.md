@@ -32,7 +32,7 @@ More detail is in:
 
 First, make the Kaggle data available in one of two ways:
 
-1. Automatic: create a Kaggle API token and place it at `~/.kaggle/kaggle.json`.
+1. Automatic: create a Kaggle API token and place it at `~/.kaggle/kaggle.json`. My file is as below: {"username":"khangng*****","key":<REDACTED>}
 2. Manual: download the Olist dataset from Kaggle and unzip the 9 CSV files into `data/raw/`.
 
 Then run:
