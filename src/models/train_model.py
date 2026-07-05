@@ -247,11 +247,11 @@ def score_baselines(train, test, y_train, y_test):
     rate -- what happens if we can't distinguish risky from non-risky orders at all.
     Seller heuristic: use the seller's historical bad-review rate as the predicted
     risk -- a practical baseline the model needs to beat to justify extra complexity."""
-    print("[model] Scoring constant baseline...")
+    print("[model-baseline] Scoring constant baseline...")
     const_score = np.full(len(test), y_train.mean())
     const_result = evaluate_scores(y_test, const_score, "constant_baseline")
 
-    print("[model] Scoring seller-heuristic baseline...")
+    print("[model-baseline] Scoring seller-heuristic baseline...")
     seller_score = test["seller_bad_review_rate_smoothed"].fillna(y_train.mean()).values
     seller_result = evaluate_scores(y_test, seller_score, "seller_heuristic")
 
@@ -263,7 +263,7 @@ def fit_candidate_models(X_train, y_train, X_test, y_test):
     pipelines = build_pipelines()
     fitted, scores, results = {}, {}, []
     for name, pipe in pipelines.items():
-        print(f"[model] Fitting {name}...")
+        print(f"[model-training] Fitting {name}...")
         pipe.fit(X_train, y_train)
         score = pipe.predict_proba(X_test)[:, 1]
         results.append(evaluate_scores(y_test, score, name))
