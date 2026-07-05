@@ -1,10 +1,16 @@
 data/raw/*.csv
 data/raw/*.zip
 data/raw/*.md
-output/
+output/*
+!output/nlp/
+output/nlp/*
+!output/nlp/review_categories.csv
+!output/nlp/summary.md
 __pycache__/
 *.pyc
 .env
 .ipynb_checkpoints/
 *.egg-info/
 .DS_Store
+*.ipynb
+.jupyter
