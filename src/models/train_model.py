@@ -221,7 +221,8 @@ def df_to_md_table(df: pd.DataFrame, float_fmt="{:.4f}") -> str:
     return "\n".join(lines)
 
 
-def main():
+def load_data():
+    """Load raw tables and build the train/test feature split used for modeling."""
     print("[model] Loading raw tables...")
     raw = load_raw(RAW_DIR)
 
@@ -236,45 +237,45 @@ def main():
     print(f"[model] Train: {len(train):,} rows, Test: {len(test):,} rows "
           f"(train positive rate {train['bad_review'].mean()*100:.2f}%, "
           f"test positive rate {test['bad_review'].mean()*100:.2f}%)")
+    return raw, order_df, train, test
 
-    feature_cols = CATEGORICAL_COLS + NUMERIC_COLS
-    X_train, y_train = train[feature_cols], train["bad_review"].astype(int)
-    X_test, y_test = test[feature_cols], test["bad_review"].astype(int)
 
-    predictions = pd.DataFrame({"order_id": test["order_id"].values, "actual": y_test.values})
-    results = []
+def score_baselines(train, test, y_train, y_test):
+    """Constant and seller-heuristic baselines. Returns (metrics rows, seller score array).
 
+    Constant baseline: predict every test order at training's overall bad-review
+    rate -- what happens if we can't distinguish risky from non-risky orders at all.
+    Seller heuristic: use the seller's historical bad-review rate as the predicted
+    risk -- a practical baseline the model needs to beat to justify extra complexity."""
     print("[model] Scoring constant baseline...")
     const_score = np.full(len(test), y_train.mean())
-    results.append(evaluate_scores(y_test, const_score, "constant_baseline"))
+    const_result = evaluate_scores(y_test, const_score, "constant_baseline")
 
     print("[model] Scoring seller-heuristic baseline...")
     seller_score = test["seller_bad_review_rate_smoothed"].fillna(y_train.mean()).values
-    results.append(evaluate_scores(y_test, seller_score, "seller_heuristic"))
-    predictions["seller_heuristic_score"] = seller_score
+    seller_result = evaluate_scores(y_test, seller_score, "seller_heuristic")
 
+    return [const_result, seller_result], seller_score
+
+
+def fit_candidate_models(X_train, y_train, X_test, y_test):
+    """Fit all candidate pipelines. Returns (fitted pipelines, test scores, metrics rows)."""
     pipelines = build_pipelines()
-    fitted, scores = {}, {}
+    fitted, scores, results = {}, {}, []
     for name, pipe in pipelines.items():
         print(f"[model] Fitting {name}...")
         pipe.fit(X_train, y_train)
         score = pipe.predict_proba(X_test)[:, 1]
         results.append(evaluate_scores(y_test, score, name))
-        predictions[f"{name}_score"] = score
         fitted[name] = pipe
         scores[name] = score
+    return fitted, scores, results
 
-    metrics_df = pd.DataFrame(results)
 
-    order_value_test = (test["total_item_price"].fillna(0) + test["total_freight_value"].fillna(0)).values
-    pr_at_k = {
-        name: precision_recall_at_k(y_test.values, score, K_TOP_FRACTIONS, order_value_test)
-        for name, score in {"seller_heuristic": seller_score, **scores}.items()
-    }
-
-    # Apply the pre-committed decision rule (see constants above
-    # build_pipelines()): does random_forest earn the shipped-model slot
-    # away from HGB, or does it stay a documented-but-not-shipped cross-check?
+def select_shipped_model(metrics_df, pr_at_k) -> str:
+    """Apply the pre-committed decision rule (see constants above build_pipelines()):
+    does random_forest earn the shipped-model slot away from HGB, or does it stay
+    a documented-but-not-shipped cross-check?"""
     metrics_by_name = metrics_df.set_index("model")
     hgb_row, rf_row = metrics_by_name.loc["hist_gradient_boosting"], metrics_by_name.loc["random_forest"]
     recall20 = {n: pr_at_k[n].set_index("k_pct").loc[20, "recall"] for n in ("hist_gradient_boosting", "random_forest")}
@@ -283,32 +284,23 @@ def main():
     rf_calibration_ok = rf_row["brier_score"] <= RF_MAX_BRIER
     rf_ships = rf_beats_pr_auc and rf_holds_recall20 and rf_calibration_ok
     shipped_name = "random_forest" if rf_ships else DEFAULT_SHIP
-    shipped_pipeline, shipped_score = fitted[shipped_name], scores[shipped_name]
     print(f"[model] Decision rule: random_forest {'ships' if rf_ships else 'does not ship'} "
           f"(PR-AUC gain {rf_row['pr_auc'] - hgb_row['pr_auc']:+.4f}, "
           f"recall@20 {'held' if rf_holds_recall20 else 'regressed'}, "
           f"brier {rf_row['brier_score']:.4f}). Shipping: {shipped_name}.")
+    return shipped_name
 
-    predictions["risk_decile"] = pd.qcut(shipped_score, 10, labels=False, duplicates="drop")
 
-    print("[model] Computing calibration table...")
-    calib = calibration_table(y_test.values, shipped_score)
-
-    print(f"[model] Computing permutation importance ({shipped_name}, test set)...")
-    imp = permutation_importance_table(shipped_pipeline, X_test, y_test, feature_cols)
-    coefs = lr_coefficients(fitted["logistic_regression"])
-
-    print("[model] Building current seller risk table...")
-    seller_risk_table = build_current_seller_risk_table(raw, order_df)
-
+def save_csv_artifacts(predictions, seller_risk_table, imp, coefs, shipped_pipeline) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
     predictions.to_csv(OUTPUT_DIR / "test_predictions.csv", index=False)
     seller_risk_table.to_csv(OUTPUT_DIR / "seller_risk_table.csv", index=False)
     imp.to_csv(OUTPUT_DIR / "permutation_importance.csv", index=False)
     coefs.to_csv(OUTPUT_DIR / "lr_coefficients.csv", index=False)
     joblib.dump(shipped_pipeline, OUTPUT_DIR / "model.joblib")
 
+
+def save_feature_importance_plot(imp, shipped_name) -> None:
     fig, ax = plt.subplots(figsize=(6, 5))
     top_imp = imp.head(15).sort_values("importance_mean")
     ax.barh(top_imp["feature"], top_imp["importance_mean"], xerr=top_imp["importance_std"], color="#4C72B0")
@@ -318,6 +310,8 @@ def main():
     fig.savefig(OUTPUT_DIR / "feature_importance.png", bbox_inches="tight")
     plt.close(fig)
 
+
+def save_calibration_plot(calib, shipped_name) -> None:
     fig, ax = plt.subplots(figsize=(5, 5))
     ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="perfect calibration")
     ax.plot(calib["mean_predicted"], calib["mean_actual"], marker="o", color="#C44E52", label=shipped_name)
@@ -329,6 +323,8 @@ def main():
     fig.savefig(OUTPUT_DIR / "calibration.png", bbox_inches="tight")
     plt.close(fig)
 
+
+def write_metrics_report(train, test, y_train, y_test, shipped_name, metrics_df, pr_at_k, calib) -> None:
     lines = ["# Modeling Summary\n", "Auto-generated by `src/models/train_model.py`. Do not hand-edit.\n"]
     lines.append(f"\nTrain: {len(train):,} orders, Test: {len(test):,} orders "
                  f"(time-based split -- see `output/features/schema.md`).\n")
@@ -359,6 +355,60 @@ def main():
     lines.append(f"- `model.joblib` -- fitted {shipped_name} pipeline")
 
     (OUTPUT_DIR / "metrics.md").write_text("\n".join(lines))
+
+
+def main():
+    raw, order_df, train, test = load_data()
+
+    print("[model] Preparing data...")
+    feature_cols = CATEGORICAL_COLS + NUMERIC_COLS
+    X_train, y_train = train[feature_cols], train["bad_review"].astype(int)
+    X_test, y_test = test[feature_cols], test["bad_review"].astype(int)
+    predictions = pd.DataFrame({"order_id": test["order_id"].values, "actual": y_test.values})
+
+    print("[model] Scoring baselines...")
+    baseline_results, seller_score = score_baselines(train, test, y_train, y_test)
+    predictions["seller_heuristic_score"] = seller_score
+
+    print("[model] Fitting candidate models...")
+    fitted, scores, model_results = fit_candidate_models(X_train, y_train, X_test, y_test)
+    for name, score in scores.items():
+        predictions[f"{name}_score"] = score
+
+    print("[model] Computing PR@K metrics...")
+    metrics_df = pd.DataFrame(baseline_results + model_results)
+    order_value_test = (test["total_item_price"].fillna(0) + test["total_freight_value"].fillna(0)).values
+    pr_at_k = {
+        name: precision_recall_at_k(y_test.values, score, K_TOP_FRACTIONS, order_value_test)
+        for name, score in {"seller_heuristic": seller_score, **scores}.items()
+    }
+
+    print("[model] Selecting shipped model...")
+    shipped_name = select_shipped_model(metrics_df, pr_at_k)
+    shipped_pipeline, shipped_score = fitted[shipped_name], scores[shipped_name]
+    predictions["risk_decile"] = pd.qcut(shipped_score, 10, labels=False, duplicates="drop")
+
+    print("[model] Computing calibration table...")
+    # Sort test orders by predicted risk and split them into 10 groups, or deciles
+    calib = calibration_table(y_test.values, shipped_score)
+
+    print(f"[model] Computing permutation importance ({shipped_name}, test set)...")
+    # Measure how much model performance degrades when each feature is randomly shuffled
+    imp = permutation_importance_table(shipped_pipeline, X_test, y_test, feature_cols)
+
+    # Extract coefficients from a fitted logistic regression model to use as an interpretability cross-check
+    coefs = lr_coefficients(fitted["logistic_regression"])
+
+    print("[model] Building current seller risk table...")
+    seller_risk_table = build_current_seller_risk_table(raw, order_df)
+
+    print("[model] Saving artifacts...")
+    save_csv_artifacts(predictions, seller_risk_table, imp, coefs, shipped_pipeline)
+    save_feature_importance_plot(imp, shipped_name)
+    save_calibration_plot(calib, shipped_name)
+    
+    print("[model] Writing metrics report...")
+    write_metrics_report(train, test, y_train, y_test, shipped_name, metrics_df, pr_at_k, calib)
 
     print(f"\n[model] Done. See {OUTPUT_DIR / 'metrics.md'} and other artifacts under {OUTPUT_DIR}/")
     return 0
