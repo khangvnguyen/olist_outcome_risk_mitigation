@@ -105,6 +105,17 @@ SEASON_MAP = {
 }
 
 
+def _shrink_toward_baseline(cum_prior, n_prior, baseline_rate, k):
+    """Shrinkage-toward-baseline estimate: blend an entity's own prior-orders
+    rate with a baseline rate (global or category), weighted by how much
+    prior history the entity has (`k` = the "worth this many baseline
+    orders" constant). Computed from sums directly rather than
+    `n_prior * raw_rate` so that `n_prior == 0` (no history yet) can't
+    silently multiply a NaN raw rate into the result -- it correctly
+    reduces to `baseline_rate` instead."""
+    return (cum_prior + k * baseline_rate) / (n_prior + k)
+
+
 def _prior_cumsum(df: pd.DataFrame, group_col: str, value_col: str, valid_col: str):
     """Prior-only (excludes current row) cumulative sum/count of `value_col`,
     within groups of `group_col`, given df already sorted by purchase time.
@@ -135,6 +146,12 @@ def build_feature_table(raw: dict) -> pd.DataFrame:
 
     df["primary_category"] = df["primary_category"].fillna("unknown")
 
+    # Each outcome is split into a 0/1 "_val" (NaN treated as 0, only safe
+    # because "_valid" tracks which rows actually count) and a "_valid" mask
+    # (1 = outcome is known). _prior_cumsum() below sums both in lockstep, so
+    # an order with an unresolved outcome (e.g. no review yet) contributes 0
+    # to the numerator AND 0 to the denominator -- "not yet observed", not
+    # "observed as good".
     df["_bad_val"] = np.where(df["bad_review"].notna(), df["bad_review"].astype(float), 0.0)
     df["_bad_valid"] = df["bad_review"].notna().astype(int)
     df["_late_val"] = np.where(df["is_late"].notna(), df["is_late"].astype(float), 0.0)
@@ -181,16 +198,14 @@ def build_feature_table(raw: dict) -> pd.DataFrame:
     global_late_rate_filled = df["global_late_rate_prior"].fillna(train_late_mean)
     cat_rate_filled = df["cat_rate_prior"].fillna(global_rate_filled)
 
-    # shrinkage: sums directly, not n*raw_rate (see module/plan notes -- avoids
-    # a silent 0*NaN when n_prior == 0)
-    df["seller_bad_review_rate_smoothed"] = (
-        (df["seller_bad_cum_prior"] + K_SELLER * global_rate_filled) / (df["seller_n_cum_prior"] + K_SELLER)
+    df["seller_bad_review_rate_smoothed"] = _shrink_toward_baseline(
+        df["seller_bad_cum_prior"], df["seller_n_cum_prior"], global_rate_filled, K_SELLER
     )
-    df["seller_late_rate_smoothed"] = (
-        (df["seller_late_cum_prior"] + K_SELLER * global_late_rate_filled) / (df["seller_late_n_cum_prior"] + K_SELLER)
+    df["seller_late_rate_smoothed"] = _shrink_toward_baseline(
+        df["seller_late_cum_prior"], df["seller_late_n_cum_prior"], global_late_rate_filled, K_SELLER
     )
-    df["product_bad_review_rate_smoothed"] = (
-        (df["product_bad_cum_prior"] + K_PRODUCT * cat_rate_filled) / (df["product_n_cum_prior"] + K_PRODUCT)
+    df["product_bad_review_rate_smoothed"] = _shrink_toward_baseline(
+        df["product_bad_cum_prior"], df["product_n_cum_prior"], cat_rate_filled, K_PRODUCT
     )
     df["seller_n_orders_to_date"] = df["seller_n_cum_prior"]
     df["product_n_orders_to_date"] = df["product_n_cum_prior"]

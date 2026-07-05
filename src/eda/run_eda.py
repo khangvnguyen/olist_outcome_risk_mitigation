@@ -14,6 +14,20 @@ Design intent: this script produces PLAIN NUMBERS AND PLOTS, not
 conclusions -- interpretation happens in docs/problem_framing.md (revised
 after reading this output) and eventually README.md. Keeping the split
 this way makes it easy to see what's a measured fact vs. a judgment call.
+
+Sections (see each section_* function's docstring for detail):
+     1. Data quality checks
+     2. Target candidate distributions (bad_review, is_late, canceled)
+     3. How related are the candidate targets? (does lateness predict bad_review?)
+     4. Seller-level variance (is bad_review concentrated in a few sellers?)
+     5. Product category variance
+     6. Price, freight, and payment structure
+     7. Customer-seller distance
+     8. Time trends
+     9. Product-level concentration (sharper than category?)
+    10. Geographic patterns (buyer/seller state, city, lane)
+    11. Business impact: revenue at risk and repurchase
+    12. Qualitative signal: what do bad-but-on-time reviews say?
 """
 
 import sys
@@ -70,6 +84,24 @@ def weighted_std(values, weights):
     return np.sqrt(np.average((values - avg) ** 2, weights=weights))
 
 
+def grouped_bad_review_rate(df, group_col, min_orders=30):
+    """Order count + mean bad_review rate per value of `group_col`, dropping
+    rows with a missing group value or unknown outcome, keeping only groups
+    with at least `min_orders` orders (below that, a group's rate is mostly
+    noise), sorted worst-rate-first. Shared by every section below that asks
+    "does this categorical column carry signal?" (category, customer/seller
+    state, customer/seller city) -- seller- and product-level variance use a
+    different, richer aggregation (`build_seller_level_table` /
+    `build_product_level_table` in loader.py) and are not folded in here."""
+    sub = df.dropna(subset=[group_col, "bad_review"])
+    return (
+        sub.groupby(group_col)
+        .agg(n_orders=("order_id", "count"), bad_review_rate=("bad_review", "mean"))
+        .query("n_orders >= @min_orders")
+        .sort_values("bad_review_rate", ascending=False)
+    )
+
+
 class Report:
     """Accumulates markdown sections in order, written out at the end."""
     def __init__(self):
@@ -96,6 +128,8 @@ class Report:
 # ---------------------------------------------------------------------
 
 def section_data_quality(raw, df, report: Report):
+    """How much missingness/duplication is there in the columns EDA and
+    modeling actually depend on -- is the data clean enough to trust?"""
     report.h2("1. Data quality checks")
 
     n_orders = len(df)
@@ -137,6 +171,8 @@ def section_data_quality(raw, df, report: Report):
 
 
 def section_target_candidates(df, report: Report):
+    """How common is each candidate "bad outcome" (bad_review, is_late,
+    canceled) on its own, before checking how related they are to each other?"""
     report.h2("2. Target candidate distributions")
 
     review_dist = df["review_score"].value_counts(dropna=False).sort_index()
@@ -182,6 +218,9 @@ def section_target_candidates(df, report: Report):
 
 
 def section_target_overlap(df, report: Report):
+    """Does late delivery actually predict a low review score, or are they
+    weakly linked -- the finding that decides whether bad_review should be
+    the sole target rather than a composite with lateness/cancellation."""
     report.h2("3. How related are the candidate targets?")
     report.p("Key question from problem_framing.md: does late delivery actually predict "
               "low review score, or are they weakly linked (which would argue for treating "
@@ -241,6 +280,9 @@ def section_target_overlap(df, report: Report):
 
 
 def section_seller_variance(df, raw, report: Report):
+    """Is bad_review rate concentrated in a small number of sellers, or
+    diffuse across most of them -- and does seller order volume itself
+    correlate with quality?"""
     report.h2("4. Seller-level variance (is this a seller problem?)")
     report.p("**Attribution caveat:** for orders with more than one seller, that order's single "
               "bad_review outcome is attributed to every seller involved (can't split blame from "
@@ -314,13 +356,11 @@ def section_seller_variance(df, raw, report: Report):
 
 
 def section_category_variance(df, report: Report):
+    """Does product category carry real signal on its own, independent of
+    seller/product history?"""
     report.h2("5. Product category variance")
 
-    sub = df.dropna(subset=["primary_category", "bad_review"])
-    cat_stats = sub.groupby("primary_category").agg(
-        n_orders=("order_id", "count"),
-        bad_review_rate=("bad_review", "mean"),
-    ).query("n_orders >= 30").sort_values("bad_review_rate", ascending=False)
+    cat_stats = grouped_bad_review_rate(df, "primary_category", min_orders=30)
 
     rel = save_table(cat_stats.reset_index(), "category_bad_review_rates")
     report.table_ref("bad_review rate by product category (n_orders>=30), sorted worst-first", rel)
@@ -352,6 +392,8 @@ def section_category_variance(df, report: Report):
 
 
 def section_price_freight(df, report: Report):
+    """Do order economics (item price, freight, installments, payment type)
+    differ between good and bad-review orders?"""
     report.h2("6. Price, freight, and payment structure")
 
     sub = df.dropna(subset=["bad_review"])
@@ -380,6 +422,8 @@ def section_price_freight(df, report: Report):
 
 
 def section_distance(df, report: Report):
+    """Does physical customer-seller distance predict bad_review, either
+    directly or as a proxy for delivery lateness?"""
     report.h2("7. Customer-seller distance")
     report.p("Distance uses the primary (highest-price-item) seller's zip centroid vs. the "
               "customer's zip centroid -- an approximation for multi-seller orders (~2% of orders), "
@@ -415,6 +459,8 @@ def section_distance(df, report: Report):
 
 
 def section_time_trends(df, report: Report):
+    """Is bad_review rate stable over time, or does it drift -- relevant to
+    whether a time-based train/test split will see a base-rate shift."""
     report.h2("8. Time trends")
 
     sub = df.dropna(subset=["order_purchase_timestamp", "bad_review"]).copy()
@@ -423,6 +469,7 @@ def section_time_trends(df, report: Report):
         n_orders=("order_id", "count"),
         bad_review_rate=("bad_review", "mean"),
     )
+    monthly = monthly[monthly["n_orders"] > 500]  # So that the months with too few orders at the two ends are excluded
     rel = save_table(monthly.reset_index(), "monthly_bad_review_rate")
     report.table_ref("Monthly order volume and bad_review rate", rel)
 
@@ -440,6 +487,8 @@ def section_time_trends(df, report: Report):
 
 
 def section_product_variance(df, raw, report: Report):
+    """Does a small number of specific bad products drive category-level
+    rates, or is badness spread evenly within categories?"""
     report.h2("9. Product-level concentration (sharper than category?)")
     report.p("Same method as the seller-level analysis (section 4), applied to individual "
               "products instead of the coarser category grouping in section 5. Question: does "
@@ -479,16 +528,16 @@ def section_product_variance(df, raw, report: Report):
 
 
 def section_geography(df, report: Report):
+    """Do specific customer/seller regions (state, city, or a seller-state
+    -> customer-state "lane") have systematically different bad_review
+    rates, independent of raw distance (section 7)?"""
     report.h2("10. Geographic patterns (buyer and seller location)")
     report.p("Distinct from section 7 (physical distance): this asks whether specific customer "
               "or seller regions have systematically different bad_review rates, independent of "
               "how far apart buyer and seller are.\n")
 
     # customer state
-    sub = df.dropna(subset=["customer_state", "bad_review"])
-    cust_state = sub.groupby("customer_state").agg(
-        n_orders=("order_id", "count"), bad_review_rate=("bad_review", "mean")
-    ).query("n_orders >= 30").sort_values("bad_review_rate", ascending=False)
+    cust_state = grouped_bad_review_rate(df, "customer_state", min_orders=30)
     rel = save_table(cust_state.reset_index(), "bad_review_by_customer_state")
     report.table_ref("bad_review rate by customer_state (n_orders>=30)", rel)
     if len(cust_state) > 0:
@@ -498,10 +547,7 @@ def section_geography(df, report: Report):
                   f"volume-weighted std={cust_wstd*100:.2f} pp")
 
     # seller state
-    sub2 = df.dropna(subset=["seller_state", "bad_review"])
-    sell_state = sub2.groupby("seller_state").agg(
-        n_orders=("order_id", "count"), bad_review_rate=("bad_review", "mean")
-    ).query("n_orders >= 30").sort_values("bad_review_rate", ascending=False)
+    sell_state = grouped_bad_review_rate(df, "seller_state", min_orders=30)
     rel = save_table(sell_state.reset_index(), "bad_review_by_seller_state")
     report.table_ref("bad_review rate by seller_state (n_orders>=30)", rel)
     if len(sell_state) > 0:
@@ -525,10 +571,7 @@ def section_geography(df, report: Report):
         ("customer_city", "customer_city", "bad_review_by_customer_city"),
         ("seller_city", "seller_city", "bad_review_by_seller_city"),
     ]:
-        s = df.dropna(subset=[col, "bad_review"])
-        city_stats = s.groupby(col).agg(
-            n_orders=("order_id", "count"), bad_review_rate=("bad_review", "mean")
-        ).query("n_orders >= 50").sort_values("bad_review_rate", ascending=False)
+        city_stats = grouped_bad_review_rate(df, col, min_orders=50)
         rel = save_table(city_stats.reset_index(), fname)
         report.table_ref(f"bad_review rate by {label} (n_orders>=50; small-n noise likely even at this threshold)", rel)
 
@@ -564,6 +607,8 @@ def section_geography(df, report: Report):
 
 
 def section_business_impact(df, report: Report):
+    """What's the R$ value sitting in bad-review orders, and is there
+    evidence bad reviews cost future repeat-purchase revenue?"""
     report.h2("11. Business impact: revenue at risk and repurchase")
     report.p("Translates statistical patterns into rough R$ terms. These are descriptive / "
               "correlational estimates, not causal -- see caveats inline.\n")
@@ -666,6 +711,8 @@ me te lhe lhes nos vos ja mesmo mesma sobre depois antes
 
 
 def section_qualitative_text(df, report: Report):
+    """What's actually going wrong on the 66% of bad reviews that arrive
+    on time (section 3), since no structured column captures that?"""
     report.h2("12. Qualitative signal: what do bad-but-on-time reviews say?")
     report.p("Section 3 showed 66% of bad reviews happen on orders that arrived on time -- so "
               "what's driving those? `review_comment_message` can't be a model FEATURE (it's only "

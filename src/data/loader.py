@@ -146,6 +146,73 @@ def build_payments_agg(order_payments: pd.DataFrame) -> pd.DataFrame:
     return agg.merge(mode_type, on="order_id", how="left")
 
 
+def _attach_geo_and_distance(df: pd.DataFrame, raw: dict, geo_lookup: pd.DataFrame) -> pd.DataFrame:
+    """Attach customer and (primary-seller) geolocation, then derive the
+    customer<->seller haversine distance. Note: for multi-seller orders this
+    only reflects one seller's location, not all of them -- an
+    approximation, flagged in EDA output."""
+    df = df.merge(
+        geo_lookup.rename(columns={"zip_code_prefix": "customer_zip_code_prefix",
+                                     "lat": "customer_lat", "lng": "customer_lng"})[
+            ["customer_zip_code_prefix", "customer_lat", "customer_lng"]
+        ],
+        on="customer_zip_code_prefix", how="left",
+    )
+
+    seller_info = raw["sellers"][["seller_id", "seller_zip_code_prefix", "seller_state", "seller_city"]].rename(
+        columns={"seller_id": "primary_seller_id"}
+    )
+    df = df.merge(seller_info, on="primary_seller_id", how="left")
+    df = df.merge(
+        geo_lookup.rename(columns={"zip_code_prefix": "seller_zip_code_prefix",
+                                     "lat": "seller_lat", "lng": "seller_lng"})[
+            ["seller_zip_code_prefix", "seller_lat", "seller_lng"]
+        ],
+        on="seller_zip_code_prefix", how="left",
+    )
+    df["customer_seller_distance_km"] = haversine_km(
+        df["customer_lat"], df["customer_lng"], df["seller_lat"], df["seller_lng"]
+    )
+    return df
+
+
+def _add_target_and_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Derive the target candidates (bad_review, is_late,
+    is_canceled_or_unavailable) plus supporting diagnostic/business columns.
+
+    Note: bad_review/is_late use pandas' nullable "boolean" dtype (not plain
+    numpy bool/float) so that missing values coexist with True/False *and*
+    groupby/comparisons against literal True/False work correctly. A plain
+    np.where(...) here would silently produce float64 (0.0/1.0/nan), where
+    e.g. series.get(False) fails to match the 0.0 index label -- a real bug
+    caught during testing.
+    """
+    df["bad_review"] = pd.array(
+        np.where(df["review_score"].notna(), df["review_score"] <= 2, pd.NA),
+        dtype="boolean",
+    )
+    df["is_late"] = pd.array(
+        np.where(
+            df["order_delivered_customer_date"].notna(),
+            df["order_delivered_customer_date"] > df["order_estimated_delivery_date"],
+            pd.NA,
+        ),
+        dtype="boolean",
+    )
+    df["days_late"] = (df["order_delivered_customer_date"] - df["order_estimated_delivery_date"]).dt.total_seconds() / 86400
+    df["is_canceled_or_unavailable"] = df["order_status"].isin(CANCELED_STATUSES)
+    df["delivery_days"] = (df["order_delivered_customer_date"] - df["order_purchase_timestamp"]).dt.total_seconds() / 86400
+    df["estimated_delivery_days"] = (df["order_estimated_delivery_date"] - df["order_purchase_timestamp"]).dt.total_seconds() / 86400
+    df["has_review_comment"] = df["review_comment_message"].notna()
+
+    # order_value: item price + freight, used for revenue-at-risk analysis.
+    # Deliberately NOT total_payment_value -- payments can include e.g.
+    # voucher amounts that don't map cleanly to items, whereas this ties
+    # directly to what was actually bought and shipped.
+    df["order_value"] = df["total_item_price"] + df["total_freight_value"]
+    return df
+
+
 def build_order_level_table(raw: dict) -> pd.DataFrame:
     """Assemble a single order-level DataFrame joining all 9 tables.
 
@@ -170,62 +237,8 @@ def build_order_level_table(raw: dict) -> pd.DataFrame:
     df = df.merge(items_agg, on="order_id", how="left")
     df = df.merge(payments_agg, on="order_id", how="left")
 
-    # customer geolocation (by zip prefix)
-    df = df.merge(
-        geo_lookup.rename(columns={"zip_code_prefix": "customer_zip_code_prefix",
-                                     "lat": "customer_lat", "lng": "customer_lng"})[
-            ["customer_zip_code_prefix", "customer_lat", "customer_lng"]
-        ],
-        on="customer_zip_code_prefix", how="left",
-    )
-
-    # seller geolocation + state/city, via the primary (highest-price-item)
-    # seller's zip. Note: for multi-seller orders this is only one seller's
-    # location, not all of them -- an approximation, flagged in EDA output.
-    seller_info = raw["sellers"][["seller_id", "seller_zip_code_prefix", "seller_state", "seller_city"]].rename(
-        columns={"seller_id": "primary_seller_id"}
-    )
-    df = df.merge(seller_info, on="primary_seller_id", how="left")
-    df = df.merge(
-        geo_lookup.rename(columns={"zip_code_prefix": "seller_zip_code_prefix",
-                                     "lat": "seller_lat", "lng": "seller_lng"})[
-            ["seller_zip_code_prefix", "seller_lat", "seller_lng"]
-        ],
-        on="seller_zip_code_prefix", how="left",
-    )
-    df["customer_seller_distance_km"] = haversine_km(
-        df["customer_lat"], df["customer_lng"], df["seller_lat"], df["seller_lng"]
-    )
-
-    # target candidates
-    # Note: using pandas' nullable "boolean" dtype (not plain numpy bool/float)
-    # so that missing values coexist with True/False *and* groupby/comparisons
-    # against literal True/False work correctly. A plain np.where(...) here
-    # would silently produce float64 (0.0/1.0/nan), where e.g. series.get(False)
-    # fails to match the 0.0 index label -- a real bug caught during testing.
-    df["bad_review"] = pd.array(
-        np.where(df["review_score"].notna(), df["review_score"] <= 2, pd.NA),
-        dtype="boolean",
-    )
-    df["is_late"] = pd.array(
-        np.where(
-            df["order_delivered_customer_date"].notna(),
-            df["order_delivered_customer_date"] > df["order_estimated_delivery_date"],
-            pd.NA,
-        ),
-        dtype="boolean",
-    )
-    df["days_late"] = (df["order_delivered_customer_date"] - df["order_estimated_delivery_date"]).dt.total_seconds() / 86400
-    df["is_canceled_or_unavailable"] = df["order_status"].isin(CANCELED_STATUSES)
-    df["delivery_days"] = (df["order_delivered_customer_date"] - df["order_purchase_timestamp"]).dt.total_seconds() / 86400
-    df["estimated_delivery_days"] = (df["order_estimated_delivery_date"] - df["order_purchase_timestamp"]).dt.total_seconds() / 86400
-    df["has_review_comment"] = df["review_comment_message"].notna()
-
-    # order_value: item price + freight, used for revenue-at-risk analysis.
-    # Deliberately NOT total_payment_value -- payments can include e.g.
-    # voucher amounts that don't map cleanly to items, whereas this ties
-    # directly to what was actually bought and shipped.
-    df["order_value"] = df["total_item_price"] + df["total_freight_value"]
+    df = _attach_geo_and_distance(df, raw, geo_lookup)
+    df = _add_target_and_derived_columns(df)
 
     return df
 
