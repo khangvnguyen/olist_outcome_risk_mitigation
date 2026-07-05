@@ -28,6 +28,7 @@ Sections (see each section_* function's docstring for detail):
     10. Geographic patterns (buyer/seller state, city, lane)
     11. Business impact: revenue at risk and repurchase
     12. Qualitative signal: what do bad-but-on-time reviews say?
+    13. LLM-categorized complaint reasons (src/nlp/categorize_reviews.py output)
 """
 
 import sys
@@ -50,6 +51,7 @@ warnings.filterwarnings("ignore")
 OUTPUT_DIR = Path(__file__).resolve().parents[2] / "output" / "eda"
 FIG_DIR = OUTPUT_DIR / "figures"
 TABLE_DIR = OUTPUT_DIR / "tables"
+NLP_CATEGORIES_PATH = OUTPUT_DIR.parent / "nlp" / "review_categories.csv"
 
 plt.rcParams["figure.dpi"] = 110
 plt.rcParams["axes.grid"] = True
@@ -754,6 +756,135 @@ def section_qualitative_text(df, report: Report):
                   "defect terms) that's most informative here.")
 
 
+def section_review_categories(df, report: Report):
+    """Section 12 could only guess at what drives bad-but-on-time reviews
+    from word frequency. `src/nlp/categorize_reviews.py` ran an LLM pass
+    that assigns each negative (score<=2) reviewed-with-comment order one of
+    8 concrete complaint categories -- this section joins that labeled data
+    back onto the order-level table to turn the guess into counts: which
+    categories dominate the on-time segment, whether the LLM's "late
+    delivery" label agrees with the structured `is_late` field, and whether
+    complaint type varies by product category or order value."""
+    report.h2("13. LLM-categorized complaint reasons")
+
+    if not NLP_CATEGORIES_PATH.exists():
+        report.p(f"- `{NLP_CATEGORIES_PATH.relative_to(OUTPUT_DIR.parent)}` not found -- "
+                  "`src/nlp/categorize_reviews.py` is a standalone, manually-run stage "
+                  "(needs a paid OPENROUTER_API_KEY, see its docstring) and wasn't run "
+                  "before this EDA build. Skipping this section.")
+        return
+
+    cats = pd.read_csv(NLP_CATEGORIES_PATH, usecols=["order_id", "category_id", "category_name"])
+    report.p(f"- Loaded {len(cats):,} categorized reviews from `{NLP_CATEGORIES_PATH.name}` "
+              f"(model: `google/gemini-2.5-flash`, see `output/nlp/summary.md` for category "
+              "definitions and example comments).\n")
+
+    merged = cats.merge(
+        df[["order_id", "is_late", "primary_category", "order_value", "customer_state"]],
+        on="order_id", how="left",
+    )
+
+    n_bad_total = int(df["bad_review"].fillna(False).astype(bool).sum())
+    n_bad_with_comment = int((df["bad_review"].fillna(False).astype(bool) & df["review_comment_message"].notna()).sum())
+    report.p(f"- Coverage: {len(cats):,} / {n_bad_total:,} bad reviews ({len(cats)/n_bad_total*100:.1f}%) "
+              f"have a non-empty comment and got categorized; the remaining "
+              f"{n_bad_total - n_bad_with_comment:,} bad reviews have no comment text at all and are "
+              "invisible to this analysis (not just uncategorized -- no text was ever written).")
+
+    # --- Closes the loop from section 12/3: what do the on-time bad reviews
+    # actually say, now with real counts instead of a word-frequency guess ---
+    known_lateness = merged.dropna(subset=["is_late"]).copy()
+    known_lateness["is_late"] = known_lateness["is_late"].astype(bool)
+    on_time = known_lateness[~known_lateness["is_late"]]
+    late = known_lateness[known_lateness["is_late"]]
+    if len(on_time) > 20:
+        on_time_dist = (on_time["category_name"].value_counts(normalize=True) * 100).round(1)
+        late_dist = (late["category_name"].value_counts(normalize=True) * 100).round(1)
+        cmp_table = pd.DataFrame({"on_time_pct": on_time_dist, "late_pct": late_dist}).fillna(0.0)
+        cmp_table["on_time_n"] = on_time["category_name"].value_counts()
+        cmp_table["late_n"] = late["category_name"].value_counts()
+        cmp_table = cmp_table.sort_values("on_time_pct", ascending=False)
+        rel = save_table(cmp_table.reset_index().rename(columns={"index": "category_name"}),
+                          "complaint_category_by_lateness")
+        report.table_ref("Complaint category share, on-time vs. late bad reviews", rel)
+
+        top_on_time = cmp_table.index[0]
+        report.p(f"\n- Among on-time bad reviews with a comment (n={len(on_time):,}), the top category is "
+                  f"`{top_on_time}` ({cmp_table.loc[top_on_time, 'on_time_pct']:.1f}%) -- this is the "
+                  "concrete, quantified answer to section 12's question, replacing the word-frequency "
+                  "inference with actual labels.")
+
+    # --- Validation: does the LLM's "Late Delivery" label agree with the
+    # structured is_late field? Disagreement is itself informative (customer
+    # perception of "late" vs. the estimated-date threshold used to compute
+    # is_late don't have to coincide). ---
+    late_label = merged[merged["category_name"] == "Late Delivery or Non-Delivery"]
+    late_label_known = late_label.dropna(subset=["is_late"])
+    if len(late_label_known) > 20:
+        agree_rate = late_label_known["is_late"].astype(bool).mean() * 100
+        report.p(f"\n- **Validation check:** of {len(late_label_known):,} reviews the LLM labeled "
+                  f"`Late Delivery or Non-Delivery` (with a known delivery outcome), "
+                  f"{agree_rate:.1f}% were actually late by the structured `is_late` field "
+                  f"(delivered after `order_estimated_delivery_date`). The gap is orders where the "
+                  "customer describes the delivery as late/never-arrived but the order technically "
+                  "delivered by (or before) the estimated date, or a status like non-delivery within an "
+                  "on-time window -- worth a caveat if `is_late` is ever pitched as a full proxy for "
+                  "delivery-related dissatisfaction.")
+
+    # --- Complaint category vs. product category: which product categories
+    # skew toward which complaint type? ---
+    cat_counts = merged.groupby("primary_category").size()
+    qualified_cats = cat_counts[cat_counts >= 30].index
+    sub = merged[merged["primary_category"].isin(qualified_cats)]
+    if len(sub) > 0:
+        contingency = (
+            pd.crosstab(sub["primary_category"], sub["category_name"], normalize="index") * 100
+        ).round(1)
+        rel = save_table(contingency.reset_index(), "complaint_category_by_product_category")
+        report.table_ref(
+            "Complaint category mix (%) by product category (primary_category, n_orders>=30 within "
+            "this categorized subset) -- read across a row for that category's complaint-type profile",
+            rel,
+        )
+        for label, col in [("Damaged or Broken Product", "Damaged or Broken Product"),
+                            ("Wrong Item Delivered / Product Divergence", "Wrong Item Delivered / Product Divergence")]:
+            if col in contingency.columns:
+                top3 = contingency[col].sort_values(ascending=False).head(3)
+                report.p(f"\n- Product categories with the highest `{label}` share: " +
+                          ", ".join(f"`{idx}` ({val:.1f}%)" for idx, val in top3.items()))
+
+    # --- Complaint category vs. order value ---
+    val_by_cat = merged.dropna(subset=["order_value"]).groupby("category_name")["order_value"].median().sort_values(ascending=False)
+    if len(val_by_cat) > 0:
+        rel = save_table(val_by_cat.rename("median_order_value").reset_index(), "complaint_category_median_order_value")
+        report.table_ref("Median order value by complaint category", rel)
+        report.p(f"\n- Highest median order value: `{val_by_cat.index[0]}` (R$ {val_by_cat.iloc[0]:.2f}); "
+                  f"lowest: `{val_by_cat.index[-1]}` (R$ {val_by_cat.iloc[-1]:.2f}).")
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    overall_dist = merged["category_name"].value_counts(normalize=True).sort_values() * 100
+    overall_dist.plot(kind="barh", ax=ax, color="#C44E52")
+    ax.set_xlabel("% of categorized bad reviews")
+    ax.set_title("Complaint category distribution")
+    rel = savefig(fig, "complaint_category_distribution")
+    report.fig_ref("Complaint category distribution (all categorized bad reviews)", rel)
+
+    report.p("\n**Future work (not pursued here):** this labeling is post-outcome text, so it can't be "
+              "a before-the-fact model feature (same leakage argument as section 12) -- but it has two "
+              "concrete uses beyond narrative. (1) **Ops routing:** category could drive which team a "
+              "complaint gets routed to (logistics vs. product QA vs. seller-fraud vs. support/refund), "
+              "since the categories above map fairly directly onto existing ops functions. (2) "
+              "**Category-level tracking as a seller/product quality signal:** e.g. a seller with a "
+              "rising share of `Wrong Item Delivered` or `Counterfeit` complaints (as opposed to "
+              "`Late Delivery`) points to a fulfillment-accuracy problem rather than a logistics one, "
+              "which is a different fix -- worth tracking per-seller category mix over time if this "
+              "pipeline is extended. Would need the categorization step folded into the regular "
+              "pipeline (currently a manual, paid, standalone stage, see `src/nlp/categorize_reviews.py` "
+              "docstring) and, ideally, run on ALL bad reviews rather than only the "
+              f"{len(cats)/n_bad_total*100:.0f}% with comment text to avoid survivorship bias toward "
+              "customers who bother to write something.")
+
+
 def main():
     print("[eda] Loading raw tables...")
     raw = load_raw(RAW_DIR)
@@ -799,6 +930,9 @@ def main():
 
     print("[eda] Section 12: qualitative text...")
     section_qualitative_text(df, report)
+
+    print("[eda] Section 13: LLM-categorized complaint reasons...")
+    section_review_categories(df, report)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     report.write(OUTPUT_DIR / "summary.md")

@@ -12,7 +12,8 @@
      and unzip the 9 CSVs into `data/raw/`
 2. Run `docker compose up --build`
 
-Results land in `output/` (gitignored -- regenerated on each run, not committed).
+Results land in `output/` (gitignored -- regenerated on each run, not committed,
+except `output/nlp/` -- see below).
 
 ## Repo structure
 ```
@@ -22,12 +23,28 @@ src/
   eda/run_eda.py         # EDA -> output/eda/
   features/build_features.py  # leakage-safe feature table -> output/features/
   models/train_model.py  # HGB risk model + seller risk table -> output/model/
+  nlp/categorize_reviews.py  # LLM categorization of negative reviews -> output/nlp/
   pipeline.py            # single entrypoint, orchestrates all stages
 docs/
   problem_framing.md     # target definition + feature-leakage design doc
   eda_findings.md        # decision-ready EDA summary feeding the feature plan
   modeling_findings.md   # decision-ready modeling summary
 ```
+
+### Negative review categorization (`src/nlp/categorize_reviews.py`)
+
+A separate, manually-run stage: it sends the ~1-2 star review comments through
+OPENROUTER (`OPENROUTER_API_KEY` required) in chunks, sorting each into one of 8
+complaint categories (late delivery, wrong item, damaged product, etc.).
+It's **not** wired into `src/pipeline.py` / `docker compose up`, since it's
+the only stage with a paid external API dependency:
+```
+export OPENROUTER_API_KEY=...
+python -m src.nlp.categorize_reviews
+```
+Its two output files (`output/nlp/review_categories.csv`, `output/nlp/summary.md`)
+are committed to the repo (a deliberate `.gitignore` exception) so the
+results are reviewable without needing your own API key.
 
 ## Problem framing
 
@@ -51,9 +68,14 @@ catch? Full reasoning: `docs/problem_framing.md`.
   category > seller state > distance (`docs/eda_findings.md`) -- *who*
   sold/made the product matters far more than distance or seller state.
 - **66% of bad reviews happen on orders that arrive on time** -- lateness
-  ~6x's the per-order risk (~54% vs. ~9%) but is only a partial lever;
-  review text points to product-mismatch/defect complaints as the other
-  major driver, which no structured column captures.
+  ~6x's the per-order risk (~54% vs. ~9%) but is only a partial lever. LLM
+  categorization of the complaint text (`src/nlp/categorize_reviews.py`)
+  shows those on-time bad reviews are mostly **incomplete orders (25.5%)
+  and wrong/divergent items (19.3%)**, not damage or "poor quality" as a
+  first word-frequency pass suggested -- a fulfillment-accuracy problem, no
+  structured column captures it, and it varies by product category (e.g.
+  wrong-item complaints concentrate in home appliances/telephony, damage in
+  furniture/audio) (`docs/eda_findings.md`).
 - **The model works, modestly:** a HistGradientBoostingClassifier reaches
   PR-AUC 0.197 vs. a 0.109 no-model baseline. More importantly for Ops,
   at the top-20% risk threshold it achieves ~18% precision and ~33% recall,
@@ -102,3 +124,9 @@ catch? Full reasoning: `docs/problem_framing.md`.
   churn cost, which this one-shot dataset can't support.
 - Item-level, multi-seller attribution instead of the "primary
   (highest-price) item" approximation used throughout (~2% of orders).
+- Fold complaint categorization into the regular pipeline and extend it to
+  the 25% of bad reviews with no comment text, then use category *mix*
+  (not just rate) for ops ticket routing and as a seller/product signal
+  that distinguishes fulfillment-accuracy or fraud problems from logistics
+  ones -- not usable as a model feature (post-outcome text), but actionable
+  on its own (`docs/eda_findings.md`).
